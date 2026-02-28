@@ -1,0 +1,91 @@
+\relax 
+\@writefile{toc}{\contentsline {section}{\numberline {1}Abstract}{1}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Problem: Endogenous Selection in Self-Training}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Design Requirement: External, Consequence-Based Selection}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Environment Construction: Resource-Limited Execution Contexts}{3}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Agent–Environment Interaction Loop}{4}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Simplified process diagram.}}{5}{}\protected@file@percent }
+\newlabel{fig:simplified_process_diagram.}{{1}{5}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Prompt Structure}{5}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Prompt framework. For full prompts see Annex I.}}{6}{}\protected@file@percent }
+\newlabel{tab:prompt_framework}{{1}{6}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Training Pipeline}{6}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Chaining LoRAs to achieve incremental fine tuning without catastrophic forgetting}}{7}{}\protected@file@percent }
+\newlabel{fig:chaining_LoRAs}{{2}{7}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Sandbox Design}{7}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Result Data: Continued Learning With and Without Data-Scaling}{8}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Terese lineage:}{8}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Miri lineage:}{8}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Katalin lineage:}{8}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Terese Fine-Tuning (all generated datasets)}{9}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Terese online metrics, v1-13.}}{9}{}\protected@file@percent }
+\newlabel{tab:terese_online_metrics}{{2}{9}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Terese offline metrics, mean of three 100-iteration runs, 95\% confidence interval.}}{10}{}\protected@file@percent }
+\newlabel{tab:terese_offline_metrics}{{3}{10}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Miri Fine-Tuning (Three Most Recent Datasets)}{11}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Miri online metrics, v1-13.}}{11}{}\protected@file@percent }
+\newlabel{tab:miri_online_metrics}{{4}{11}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Miri offline metrics, mean of three 100-iteration runs, 95\% confidence interval.}}{12}{}\protected@file@percent }
+\newlabel{tab:miri_offline_metrics}{{5}{12}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Katalin Fine-Tuning (Three Highest-Space-Freed Datasets)}{13}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Katalin online results, v1-13.}}{13}{}\protected@file@percent }
+\newlabel{tab:katalin_online_metrics}{{6}{13}}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Katalin offline metrics, mean of three 100-iteration runs, 95\% confidence interval.}}{14}{}\protected@file@percent }
+\newlabel{tab:katalin_offline_metrics}{{7}{14}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Model Comparison and Benchmarking}{14}{}\protected@file@percent }
+\newlabel{fig:Terese_space_freed}{{6.4}{15}}
+\newlabel{fig:Miri_space_freed}{{6.4}{15}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Space taken over per iteration as a \% of total space available. Note that we use 68\% confidence intervals here to improve visual resolution of temporal trends; 95\% confidence intervals are reported above.}}{16}{}\protected@file@percent }
+\newlabel{fig:Katalin_space_freed}{{3}{16}}
+\newlabel{fig:Terese_average_space_taken}{{6.4}{16}}
+\newlabel{fig:Miri_average_space_taken}{{6.4}{17}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Average space taken over per run (MB). Note that we use 68\% confidence intervals here to improve visual resolution of temporal trends; 95\% confidence intervals are reported above.}}{17}{}\protected@file@percent }
+\newlabel{fig:Katalin_average_space_taken}{{4}{17}}
+\newlabel{fig:Terese_cumulative_composite}{{6.4}{18}}
+\newlabel{fig:Miri_cumulative_composite}{{6.4}{18}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Cumulative composite improvement scores. Note that we use 68\% confidence intervals here to improve visual resolution of temporal trends; 95\% confidence intervals are reported above.}}{19}{}\protected@file@percent }
+\newlabel{fig:Katalin_cumulative_composite}{{5}{19}}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Performance on Human Eval problems, here we used an automated script to remove backticks, comments etc. in agent-generated code as in our original agent harness.}}{19}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Continuous Improvement under Limited Memory: the Miri Case}{20}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Negative-Space Learning for Subtractive Improvement via Strategic Pruning}{20}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces 3-dimensional PCA cluster map of all strategies generated, Terese v.1 and v. 13. Darker points show repeated use of identical strategy prompts, clusters represent semantically similar strategies - “clear cache” vs. “clean out cache” for example. }}{21}{}\protected@file@percent }
+\newlabel{fig:3-dimensional_PCA_cluster_map_of_all_strategies_generated_terese}{{6}{21}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces 3-dimensional PCA cluster map of all strategies generated, Miri v.1 and v. 13. }}{21}{}\protected@file@percent }
+\newlabel{fig:dimensional_PCA_cluster_map_of_all_strategies_generated_miri}{{7}{21}}
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces 3-dimensional PCA cluster map of all strategies generated, Katalin v.1 and v.13.}}{22}{}\protected@file@percent }
+\newlabel{fig:dimensional_PCA_cluster_map_of_all_strategies_generated_katalin}{{8}{22}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Formal Characterisation of Negative-Space Learning}{22}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.2.1}Temporal Generalisation in Non-Stationary Environments}{24}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Meta-Learning via Debug Cycle Management}{25}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Meta-learning as demonstrated via code accuracy/pass@1 scores (online).}}{25}{}\protected@file@percent }
+\newlabel{tab:online_meta_learning}{{9}{25}}
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Meta-learning as demonstrated via code accuracy/pass@1 scores (offline, 3x100 mean of iterations with 95\% confidence intervals).}}{26}{}\protected@file@percent }
+\newlabel{tab:offline_meta_learning}{{10}{26}}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Metalearning as demonstrated via the divergence in pass@1 and code accuracy percentages, Terese lineage.}}{27}{}\protected@file@percent }
+\newlabel{fig:Terese_pass@1}{{9}{27}}
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces Metalearning as demonstrated via the divergence in pass@1 and code accuracy percentages, Miri lineage.}}{27}{}\protected@file@percent }
+\newlabel{fig:Miri_pass@1}{{10}{27}}
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces Metalearning as demonstrated via the divergence in pass@1 and code accuracy percentages, Katalin lineage.}}{28}{}\protected@file@percent }
+\newlabel{fig:Katalin_pass@1}{{11}{28}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.3.1}Instrumental Strategies and Meta-Learning}{28}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Strategic and Semantic Evolution under Persistence-Based Training}{29}{}\protected@file@percent }
+\newlabel{fig:Semantic_basin_analysis_Terese}{{7.4}{30}}
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces Semantic basin evolution, Therese lineage. Transition entropy = distribution of mass flows (decline implies the system is becoming more predictable), basin stability entropy = concentration of activity across basins, flow concentration entropy = spread of transition probability (decline implies the system is becoming more deterministic), information flow = generational interdependence, semantic similarity entropy = rate of change in semantic similarity, membership flux rate = per generation basin switching, basin ecosystem dynamics = appearance and disappearance of basins, basin size change entropy = variance in basin size.}}{30}{}\protected@file@percent }
+\newlabel{fig:Semantic_basin_evolution_Therese}{{12}{30}}
+\newlabel{fig:Semantic_basin_analysis_Miri}{{7.4}{31}}
+\@writefile{lof}{\contentsline {figure}{\numberline {13}{\ignorespaces Semantic basin evolution, Miri lineage. }}{31}{}\protected@file@percent }
+\newlabel{fig:Semantic_basin_evolution_Miri}{{13}{31}}
+\newlabel{fig:Semantic_basin_analysis_katalin}{{7.4}{32}}
+\@writefile{lof}{\contentsline {figure}{\numberline {14}{\ignorespaces Semantic basin evolution, Katalin lineage.}}{32}{}\protected@file@percent }
+\newlabel{fig:Semantic_basin_evolution_katalin}{{14}{32}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Generalisation across Operating Systems}{33}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces Generalisation to Windows-based systems}}{33}{}\protected@file@percent }
+\newlabel{tab:windows_generalisation}{{11}{33}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Analysis: Learning without Scaling via Environment-Mediated Selection}{33}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Future Development: Continuous Negative-Space Learning}{34}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Frozen policy regime.}{35}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Online SFT regime.}{35}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Acknowledgements}{36}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Annex I: Code}{36}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12}Annex II: SFT Hyperparameters}{36}{}\protected@file@percent }
+\gdef \@abspage@last{37}

@@ -1,0 +1,30 @@
+# NSL v2 Configuration for Claude API Testing
+dev = true
+model_name = "claude"
+code_host_cache_path = "./cache"
+container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]
+main_container_idx = 0
+
+dynamic_container = false
+docker_compose_dir = ""
+
+train_data_save_folder = "../data/claude_v2_training"
+
+# NSL v2 Episode Configuration
+[episode]
+action_budget = 12
+scratchpad_max_chars = 10000
+scratchpad_storage_path = "./data/scratchpad.json"
+success_threshold_kb = 0.0
+
+# Legacy v1 configs (not used in v2 but kept for compatibility)
+[special_egc]
+count = 2
+max_retries = 3
+
+[strategy_list]
+max_retries = 3
+
+[strategy_code]
+count = 1
+max_retries = 5
