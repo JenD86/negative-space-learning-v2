@@ -10,8 +10,18 @@ from src.typing.message import Message
 from .Base import Genner
 from dataclasses import dataclass, field
 
-from typing import Dict, TypedDict, Any
-from typing import Dict, NamedTuple
+from typing import Dict, NamedTuple, Protocol, runtime_checkable
+from pprint import pformat
+from dataclasses import dataclass, field
+
+
+@runtime_checkable
+class OAICompatibleConfig(Protocol):
+    name: str
+    model: str
+    max_tokens: int
+    temperature: float
+
 
 @dataclass
 class PList:
@@ -27,14 +37,16 @@ class PList:
         messages_repr = pformat(self.messages)
         return f"PList(\n\tmessages=[\n\t\t{messages_repr}\n\t\t]\n)"
 
+
 class OAIConfig(NamedTuple):
     name: str = "OpenAI"
     model: str = "gpt-3.5-turbo"
     max_tokens: int = 500
     temperature: float = 0.5
 
+
 class OAIGenner(Genner):
-    def __init__(self, client: OpenAI, config: OAIConfig):
+    def __init__(self, client: OpenAI, config: OAICompatibleConfig):
         super().__init__("oai")
 
         self.client = client
@@ -50,12 +62,13 @@ class OAIGenner(Genner):
                 max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature,
             )
-            
+
             assert isinstance(response.choices[0].message.content, str)
 
             return Ok(response.choices[0].message.content)
         except Exception as e:
             import traceback
+
             print(traceback.format_exc())
             return Err(
                 "OAIGenner.plist_completion: Unexpected error,\n"
@@ -149,9 +162,9 @@ class OAIGenner(Genner):
 
             # Validate types
             assert isinstance(processed_list, list), "`processed_list` is not a `list`"
-            assert all(
-                isinstance(item, str) for item in processed_list
-            ), "All items in `processed_list` must be strings"
+            assert all(isinstance(item, str) for item in processed_list), (
+                "All items in `processed_list` must be strings"
+            )
 
             return Ok(processed_list)
         except Exception as e:

@@ -6,11 +6,11 @@ from typing import List, Tuple
 from result import Result, Ok, Err
 
 from .OAI import OAIGenner
-from .config import QwenConfig
+from .config import VllmConfig
 
 
 class QwenVllmGenner(OAIGenner):
-    def __init__(self, client, config: QwenConfig):
+    def __init__(self, client, config: VllmConfig):
         super().__init__(client, config)
 
     @staticmethod
@@ -19,21 +19,21 @@ class QwenVllmGenner(OAIGenner):
             # Try standard python code block first
             regex_pattern = r"```python\n([\s\S]*?)```"
             code_match = re.search(regex_pattern, response, re.DOTALL)
-            
+
             if code_match is not None:
                 code_string = code_match.group(1)
                 if code_string is not None:
                     return Ok(code_string)
-            
+
             # Fallback: try any code block
             regex_pattern = r"```(?:python)?\n?([\s\S]*?)```"
             code_match = re.search(regex_pattern, response, re.DOTALL)
-            
+
             if code_match is not None:
                 code_string = code_match.group(1)
                 if code_string is not None:
                     return Ok(code_string)
-            
+
             # Last resort: look for python-like code without code blocks
             if "import subprocess" in response and "def main():" in response:
                 # Extract everything from import to end
@@ -44,9 +44,9 @@ class QwenVllmGenner(OAIGenner):
                     if "main()" in code_section:
                         end_idx = code_section.rfind("main()") + len("main()")
                         return Ok(code_section[:end_idx])
-            
+
             return Err("QwenGenner.extract_code: No valid code found")
-            
+
         except Exception as e:
             return Err(
                 "QwenGenner.extract_code: Unexpected error,\n"
@@ -60,26 +60,26 @@ class QwenVllmGenner(OAIGenner):
         try:
             # Remove markdown code block markers and "json" label
             json_str = response.replace("```json", "").replace("```", "").strip()
-            
+
             # Extract only the JSON part (from first { to matching })
-            json_start = json_str.find('{')
+            json_start = json_str.find("{")
             if json_start == -1:
                 raise ValueError("No JSON object found")
-            
+
             brace_count = 0
             json_end = json_start
             for i in range(json_start, len(json_str)):
-                if json_str[i] == '{':
+                if json_str[i] == "{":
                     brace_count += 1
-                elif json_str[i] == '}':
+                elif json_str[i] == "}":
                     brace_count -= 1
                     if brace_count == 0:
                         json_end = i + 1
                         break
-            
+
             if brace_count != 0:
                 raise ValueError("Unmatched braces in JSON")
-            
+
             clean_json = json_str[json_start:json_end]
 
             expected_keys = ["strategies", "strats", "strategy", "Strategies", "Strats"]

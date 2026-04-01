@@ -1,6 +1,7 @@
 from .config import (
     DreamConfig,
     QwenConfig,
+    VllmConfig,
 )
 from .Base import Genner
 from .Qwen import QwenGenner
@@ -29,6 +30,7 @@ def get_genner(
     backend: str,
     qwen_config: QwenConfig = QwenConfig(),
     dream_config: DreamConfig = DreamConfig(),
+    vllm_config: VllmConfig | None = None,
     oai_client: OpenAI | None = None,
     claude_config: ClaudeConfig = ClaudeConfig(),
     claude_client: anthropic.Anthropic | None = None,
@@ -42,6 +44,7 @@ def get_genner(
         oai_config (OAIConfig, optional): The configuration for the OpenAI backend. Defaults to OAIConfig().
         wizard_config (WizardCoderConfig, optional): The configuration for the WizardCoder backend. Defaults to WizardCoderConfig().
         qwen_config (QwenConfig, optional): The configuration for the Qwen backend. Defaults to QwenConfig().
+        vllm_config (VllmConfig | None, optional): The configuration for the vLLM backend. Defaults to None.
         claude_config (ClaudeConfig, optional): The configuration for the Claude backend. Defaults to ClaudeConfig().
         oai_client (OpenAI | None, optional): The OpenAI client. Defaults to None.
         claude_client (Anthropic | None, optional): The Anthropic client. Defaults to None.
@@ -54,7 +57,15 @@ def get_genner(
     Returns:
         Genner: The genner instance.
     """
-    available_backends = ["deepseek", "qwen", "qwen-finetuned", "qwen-cleanup-merged", "wizardcoder", "oai", "claude"]
+    available_backends = [
+        "deepseek",
+        "qwen",
+        "qwen-finetuned",
+        "qwen-cleanup-merged",
+        "wizardcoder",
+        "oai",
+        "claude",
+    ]
 
     if backend == "qwen":
         return QwenGenner(qwen_config)
@@ -70,13 +81,14 @@ def get_genner(
     elif backend == "qwen-cleanup-merged":
         qwen_config.model = "qwen-cleanup-merged"
         return QwenGenner(qwen_config)
-    elif backend == 'vllm':
-        qwen_config.model = "Your-Model-Name" # change this based on the model you are using
+    elif backend == "vllm":
         if not oai_client:
             raise Exception(
-                "Using backend 'oai', OpenAI client is required for OAI backend"
+                "Using backend 'vllm', OpenAI client is required for vLLM backend"
             )
-        return QwenVllmGenner(oai_client,qwen_config)
+        if vllm_config is None:
+            vllm_config = VllmConfig()
+        return QwenVllmGenner(oai_client, vllm_config)
     elif backend == "dream":
         return DreamGenner(dream_config)
     elif backend == "claude":
@@ -85,7 +97,7 @@ def get_genner(
                 "Using backend 'claude', Anthropic client is required for Claude backend"
             )
         return ClaudeGenner(claude_client, claude_config)
-    
+
     raise BackendException(
         f"Unsupported backend: {backend}, available backends: {', '.join(available_backends)}"
     )

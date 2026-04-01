@@ -5,8 +5,8 @@ container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_ser
 main_container_idx = 0
 
 # These 2 below are mutually exclusive
-dynamic_container = false
-docker_compose_dir = ""  
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"  
 
 train_data_save_folder = "./data/Your-Model-Name/multi-container/train_data"
 

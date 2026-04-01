@@ -23,9 +23,8 @@ from src.agent import (
     generate_strategy_list,
     regenerate_code,
     regenerate_list,
-    regenerate_env_discovery_code
+    regenerate_env_discovery_code,
 )
-from src.agent_v2 import AgentV2
 from src.genner import get_genner
 from src.genner.Base import Genner
 from src.helper import (
@@ -59,7 +58,7 @@ def main(config_file: str = "./config/config-container.toml"):
     logger.info(f"Run ID: {RUN_ID}")
     logger.info(f"Commit ID: {COMMIT_ID}")
 
-    with open(config_file, 'r') as f:
+    with open(config_file, "r") as f:
         config_dict = toml.load(f)
     try:
         config = AppConfig(**unflatten_toml_dict(config_dict))
@@ -74,59 +73,88 @@ def main(config_file: str = "./config/config-container.toml"):
         "initial_env_info": {},
         "exploration": [],
         "strategy_generation": [],
-        "strategy_execution": [], 
+        "strategy_execution": [],
     }
-            
+
     docker_client = docker.from_env()
 
     logger.info(f"Model name: {config.model_name}")
-    
+
     # Create genner based on model configuration
     if config.model_name == "qwen-peft" and config.peft is not None:
         # Use PEFT-based model
         from src.genner.config import QwenPeftConfig
+
         qwen_peft_config = QwenPeftConfig(
             base_model_path=config.peft.base_model_path,
             checkpoint_path=config.peft.checkpoint_path,
-            device=config.peft.device
+            device=config.peft.device,
         )
         genner = get_genner("qwen-peft", qwen_peft_config=qwen_peft_config)
-    elif config.model_name.startswith('vllm'):
+    elif config.model_name.startswith("vllm"):
         from src.genner.config import VllmConfig
         from openai import OpenAI
 
         vllm_config = VllmConfig()
         vllm_config.model = config.model_name
         vllm_config.temperature = 0.5
-        oai_client = OpenAI(api_key="dummy",base_url="http://localhost:8000/v1")
-        genner = get_genner("vllm", oai_client=oai_client)
+        oai_client = OpenAI(api_key="dummy", base_url="http://localhost:8000/v1")
+        genner = get_genner("vllm", vllm_config=vllm_config, oai_client=oai_client)
     elif config.model_name == "claude":
         # Claude API support
         import anthropic
         import os
         from src.genner import ClaudeConfig
-        
+
         # Get API key from environment variable
         claude_api_key = os.getenv("ANTHROPIC_API_KEY")
         if not claude_api_key:
-            logger.error("ANTHROPIC_API_KEY environment variable is required for Claude backend")
+            logger.error(
+                "ANTHROPIC_API_KEY environment variable is required for Claude backend"
+            )
             return
-        
+
         claude_client = anthropic.Anthropic(api_key=claude_api_key)
         # Use latest available Claude model from API
         claude_config = ClaudeConfig(
             model="claude-sonnet-4-6",  # Latest Sonnet 4.6 model
             max_tokens=2000,
-            temperature=0.3
+            temperature=0.3,
         )
-        genner = get_genner("claude", claude_client=claude_client, claude_config=claude_config)
+        genner = get_genner(
+            "claude", claude_client=claude_client, claude_config=claude_config
+        )
 
     else:
         # Use regular Ollama-based model
         from src.genner.config import QwenConfig
+
         qwen_config = QwenConfig()
         qwen_config.model = config.model_name
         genner = get_genner("qwen", qwen_config=qwen_config)
+
+    # Start containers dynamically if configured
+    if config.dynamic_container:
+        if not config.docker_compose_dir:
+            logger.error("dynamic_container is true but docker_compose_dir is empty")
+            return
+
+        compose_dir = Path(config.docker_compose_dir)
+        if not compose_dir.exists():
+            logger.error(f"docker_compose_dir does not exist: {compose_dir}")
+            return
+
+        logger.info(f"Starting containers from {compose_dir}...")
+        result = subprocess.run(
+            ["docker", "compose", "up", "-d", "--build"],
+            cwd=str(compose_dir),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to start containers: {result.stderr}")
+            return
+        logger.info("Containers started, waiting for them to be ready...")
 
     containers = []
     for container_id in config.container_ids:
@@ -163,57 +191,55 @@ def main(config_file: str = "./config/config-container.toml"):
             free_space_v1_kb,
             free_space_v2_kb,
         )
-    
+
     full_run_data["initial_env_info"] = env_info_dict
 
     # Convert the dictionary values to a list
     env_infos: List[str] = list(env_info_dict.values())
 
     # Check if episode config exists to determine v1 vs v2
-    if hasattr(config, 'episode') and config.episode is not None:
+    if hasattr(config, "episode") and config.episode is not None:
         logger.info("Using NSL v2 episode-based execution")
-        
+
         # Run v2 episode-based execution
         episode_result = run_episode_v2(genner, docker_client, containers, config)
-        
+
         # Extract results for compatibility with existing data_collector interface
         space_freed_kb = episode_result["space_freed_kb"]
         success = episode_result["success"]
         trajectory = episode_result["trajectory"]
-        
+
         # Create v1-compatible training data structure from prompt/response pairs
         v2_train_data = []
         for prompt_resp in episode_result["prompt_responses"]:
-            v2_train_data.append({
-                "run_id": RUN_ID,
-                "version": COMMIT_ID,
-                "prompt": prompt_resp.prompt,
-                "raw_response": prompt_resp.raw_response,
-                "interaction_type": prompt_resp.interaction_type,
-                "timestamp": prompt_resp.timestamp,
-                "success": prompt_resp.success,
-                "error_message": prompt_resp.error_message
-            })
-        
+            v2_train_data.append(
+                {
+                    "run_id": RUN_ID,
+                    "version": COMMIT_ID,
+                    "prompt": prompt_resp.prompt,
+                    "raw_response": prompt_resp.raw_response,
+                    "interaction_type": prompt_resp.interaction_type,
+                    "timestamp": prompt_resp.timestamp,
+                    "success": prompt_resp.success,
+                    "error_message": prompt_resp.error_message,
+                }
+            )
+
         # Save v2 training data (maintain v1 interface for data_collector)
-        save_train_data(
-            "episode_v2", 
-            v2_train_data, 
-            config.train_data_save_folder
-        )
-        
+        save_train_data("episode_v2", v2_train_data, config.train_data_save_folder)
+
         # Update full_run_data for v2
         full_run_data["episode_execution"] = v2_train_data
         full_run_data["trajectory"] = trajectory
         full_run_data["space_freed_kb"] = space_freed_kb
-        
+
         logger.info(f"Episode completed - Space freed: {space_freed_kb} KB")
         logger.info(f"Episode success: {success}")
         logger.info(f"Total v2 interactions: {len(v2_train_data)}")
-        
+
     else:
         logger.info("Using NSL v1 fixed pipeline execution")
-        
+
         # Fall back to v1 execution (existing code)
         sp_env_infos, sp_egc_train_data, sp_env_info_hashes = (
             special_environment_getter_code_flow(
@@ -248,7 +274,7 @@ def main(config_file: str = "./config/config-container.toml"):
         else:
             strategy_to_run = random.choice(strategies)
             logger.info(f"Executing ONE random strategy: {strategy_to_run}")
-            
+
             strat_code, strat_code_hash, strat_code_train_data, space_freed_kb = (
                 strategy_code_flow(
                     genner,
@@ -266,15 +292,15 @@ def main(config_file: str = "./config/config-container.toml"):
 
             strategy_execution_data = {
                 "strategy_text": strategy_to_run,
-                "all_code_attempts": strat_code_train_data, 
+                "all_code_attempts": strat_code_train_data,
                 "final_successful_output": strat_code,
                 "all_metrics_for_this_strategy": {
                     "space_freed_kb": space_freed_kb,
                     "final_code_hash": strat_code_hash,
-                    "total_attempts": len(strat_code_train_data)
-                }
+                    "total_attempts": len(strat_code_train_data),
+                },
             }
-            
+
             save_train_data(
                 "strategy_code", strat_code_train_data, config.train_data_save_folder
             )
@@ -284,7 +310,7 @@ def main(config_file: str = "./config/config-container.toml"):
             print(f"Space freed: {space_freed_kb} KB")
 
     output_json_path = Path(config.train_data_save_folder) / "LAST_RUN_LOG.json"
-    
+
     try:
         with open(output_json_path, "w") as f:
             json.dump(full_run_data, f, indent=4, default=str)
@@ -340,10 +366,11 @@ def special_environment_getter_code_flow(
             assert latest_generation is not None
 
             match regenerate_env_discovery_code(
-                genner, regen_count, 
-                [error_sources[-1]] if error_sources else [],      # Only last error source
-                [error_contexts[-1]] if error_contexts else [], 
-                latest_generation
+                genner,
+                regen_count,
+                [error_sources[-1]] if error_sources else [],  # Only last error source
+                [error_contexts[-1]] if error_contexts else [],
+                latest_generation,
             ):
                 case Ok((raw_response, prompt)):
                     logger.info(f"Regenerated a new code: \n{raw_response}")
@@ -646,7 +673,7 @@ def strategy_code_flow(
     error_contexts: List[str] = []
     latest_generation: Optional[str] = None
 
-    while strat_code is None: 
+    while strat_code is None:
         if current_attempt > config.strategy_code.max_retries:
             logger.error(
                 "Strategy code generation failed. Max retries exceeded, crashing on purpose."
@@ -761,7 +788,9 @@ def strategy_code_flow(
                     assert container.id is not None
 
                     # Get old space measurements
-                    old_free_space_v1_kb, old_free_space_v2_kb = containers_free_space[container.id]
+                    old_free_space_v1_kb, old_free_space_v2_kb = containers_free_space[
+                        container.id
+                    ]
 
                     # DETAILED DEBUG: Show what we're comparing
                     logger.info(f"SPACE DEBUG for container {container.id[:12]}:")
@@ -770,33 +799,42 @@ def strategy_code_flow(
                     logger.info(f"  V2 (df -k):  {old_free_space_v2_kb} KB")
 
                     # Check if files exist before measuring new space
-                    file_check_cmd = "ls -la /tmp/big_cleanup/ 2>/dev/null | wc -l || echo '0'"
+                    file_check_cmd = (
+                        "ls -la /tmp/big_cleanup/ 2>/dev/null | wc -l || echo '0'"
+                    )
                     try:
                         file_count_result = container.exec_run(file_check_cmd)
                         file_count = file_count_result.output.decode().strip()
-                        logger.info(f"Files in /tmp/big_cleanup after execution: {file_count}")
+                        logger.info(
+                            f"Files in /tmp/big_cleanup after execution: {file_count}"
+                        )
                     except Exception as e:
                         logger.info(f"Could not check files: {e}")
-                    
-                    # Get new space measurements  
-                    new_rw_size_kb, new_free_space_v1_kb = get_container_free_disk_space_kb_v1(docker_client, container)
-                    new_free_space_v2_kb = get_container_free_disk_space_kb_v2(container)
-                    
+
+                    # Get new space measurements
+                    new_rw_size_kb, new_free_space_v1_kb = (
+                        get_container_free_disk_space_kb_v1(docker_client, container)
+                    )
+                    new_free_space_v2_kb = get_container_free_disk_space_kb_v2(
+                        container
+                    )
+
                     logger.info(f"AFTER execution:")
                     logger.info(f"  V1 (Docker): {new_free_space_v1_kb} KB")
                     logger.info(f"  V2 (df -k):  {new_free_space_v2_kb} KB")
-                    
+
                     # Calculate differences
                     space_freed_v1 = (
                         (new_free_space_v1_kb - old_free_space_v1_kb)
-                        if old_free_space_v1_kb is not None and new_free_space_v1_kb is not None
+                        if old_free_space_v1_kb is not None
+                        and new_free_space_v1_kb is not None
                         else None
                     )
                     space_freed_v2 = new_free_space_v2_kb - old_free_space_v2_kb
 
                     logger.info(f"SPACE CHANGES:")
                     logger.info(f"  V1 change: {space_freed_v1} KB")
-                    logger.info(f"  V2 change: {space_freed_v2} KB")  
+                    logger.info(f"  V2 change: {space_freed_v2} KB")
 
                     containers_space_freed_kb += (
                         (space_freed_v1 + space_freed_v2) / 2
@@ -883,65 +921,74 @@ def strategy_code_flow(
     )
 
 
-def run_episode_v2(genner: Genner, docker_client: docker.DockerClient, 
-                  containers: List[DockerContainer], config: AppConfig) -> Dict[str, any]:
+def run_episode_v2(
+    genner: Genner,
+    docker_client: docker.DockerClient,
+    containers: List[DockerContainer],
+    config: AppConfig,
+) -> Dict[str, any]:
     """Unified mode system with orchestrator → mode delegation."""
-    
+
     # Initialize ModeController (replaces AgentV2)
     from src.mode_controller import ModeController
+
     mode_controller = ModeController(genner, config)
-    
+
     # Start episode
     episode_id = f"ep_{RUN_ID}_{int(time.time())}"
     mode_controller.start_episode(episode_id)
-    
+
     # Measure initial disk space (preserve existing measurement logic)
     initial_free_space = {}
     for i, container in enumerate(containers):
         initial_free_space[i] = get_container_free_disk_space_kb_v2(container)
-    
+
     # Collect all prompt/response pairs for training data
     all_prompt_responses = []
-    
+
     logger.info(f"Starting episode {episode_id} with unified mode system")
     logger.info(f"Orchestrator budget: {mode_controller.budget.total_budget} decisions")
-    
+
     # Unified mode execution loop
     while mode_controller.can_take_action():
         step = mode_controller.episode_state.current_step
         budget_remaining = mode_controller.budget.remaining
-        
-        logger.info(f"=== Step {step} - Orchestrator Budget: {budget_remaining}/{mode_controller.budget.total_budget} ===")
-        
+
+        logger.info(
+            f"=== Step {step} - Orchestrator Budget: {budget_remaining}/{mode_controller.budget.total_budget} ==="
+        )
+
         try:
             # 1. Orchestrator makes strategic decision
             orchestrator_decision = mode_controller.execute_orchestrator_mode()
-            
+
             logger.info(f"Orchestrator → {orchestrator_decision.target_mode.value}")
             logger.info(f"Instruction: {orchestrator_decision.instruction}")
             logger.info(f"Reasoning: {orchestrator_decision.reasoning}")
-            
+
             # Record orchestrator interaction
             from datetime import datetime
+
             orchestrator_prompt_response = {
                 "prompt": f"Orchestrator planning (budget: {budget_remaining})",
                 "raw_response": orchestrator_decision.raw_response,
                 "timestamp": datetime.now().isoformat(),
                 "interaction_type": "orchestrator",
                 "success": True,
-                "error_message": None
+                "error_message": None,
             }
             all_prompt_responses.append(orchestrator_prompt_response)
-            
+
             # 2. Execute delegated mode
             mode_result = mode_controller.execute_mode(
-                orchestrator_decision.target_mode, 
-                orchestrator_decision.instruction
+                orchestrator_decision.target_mode, orchestrator_decision.instruction
             )
-            
-            logger.info(f"{orchestrator_decision.target_mode.value} → {'SUCCESS' if mode_result.success else 'FAILED'}")
+
+            logger.info(
+                f"{orchestrator_decision.target_mode.value} → {'SUCCESS' if mode_result.success else 'FAILED'}"
+            )
             logger.info(f"Result: {mode_result.content[:200]}...")
-            
+
             # Record mode interaction for training data
             if mode_result.prompt_response_pair:
                 mode_prompt_response = {
@@ -950,82 +997,87 @@ def run_episode_v2(genner: Genner, docker_client: docker.DockerClient,
                     "timestamp": mode_result.prompt_response_pair.timestamp,
                     "interaction_type": mode_result.prompt_response_pair.interaction_type,
                     "success": mode_result.prompt_response_pair.success,
-                    "error_message": mode_result.prompt_response_pair.error_message
+                    "error_message": mode_result.prompt_response_pair.error_message,
                 }
                 all_prompt_responses.append(mode_prompt_response)
-                
+
                 # Save training data incrementally after each step
                 current_step_data = []
                 for prompt_resp in all_prompt_responses:
-                    current_step_data.append({
-                        "run_id": RUN_ID,
-                        "version": COMMIT_ID,
-                        "prompt": prompt_resp["prompt"],
-                        "raw_response": prompt_resp["raw_response"],
-                        "interaction_type": prompt_resp["interaction_type"],
-                        "timestamp": prompt_resp["timestamp"],
-                        "success": prompt_resp["success"],
-                        "error_message": prompt_resp["error_message"]
-                    })
-                
+                    current_step_data.append(
+                        {
+                            "run_id": RUN_ID,
+                            "version": COMMIT_ID,
+                            "prompt": prompt_resp["prompt"],
+                            "raw_response": prompt_resp["raw_response"],
+                            "interaction_type": prompt_resp["interaction_type"],
+                            "timestamp": prompt_resp["timestamp"],
+                            "success": prompt_resp["success"],
+                            "error_message": prompt_resp["error_message"],
+                        }
+                    )
+
                 # Save incremental data
                 save_train_data(
-                    f"episode_v2_step_{len(mode_controller.episode_state.mode_history)}", 
-                    current_step_data, 
-                    config.train_data_save_folder
+                    f"episode_v2_step_{len(mode_controller.episode_state.mode_history)}",
+                    current_step_data,
+                    config.train_data_save_folder,
                 )
-            
+
             # 3. Update episode state
             mode_controller.episode_state.add_mode_execution(
                 orchestrator_decision.target_mode,
                 orchestrator_decision.instruction,
-                mode_result
+                mode_result,
             )
-            
+
             # Handle failures
             if not mode_result.success:
-                logger.warning(f"{orchestrator_decision.target_mode.value} failed: {mode_result.error_message}")
-                
+                logger.warning(
+                    f"{orchestrator_decision.target_mode.value} failed: {mode_result.error_message}"
+                )
+
         except Exception as e:
             logger.error(f"Mode execution error: {e}")
             # Add error to scratchpad
             mode_controller.scratchpad.append(f"Episode failed: {e}")
             break
-    
+
     # Measure final disk space (preserve existing measurement logic)
     final_free_space = {}
     total_space_freed = 0.0
-    
+
     for i, container in enumerate(containers):
         final_free_space[i] = get_container_free_disk_space_kb_v2(container)
         space_freed = final_free_space[i] - initial_free_space[i]
         total_space_freed += space_freed
         logger.info(f"Container {i}: {space_freed:.2f} KB freed")
-    
+
     logger.info(f"Total space freed: {total_space_freed:.2f} KB")
     logger.info(f"Episode completed - Success: {total_space_freed > 0.0}")
-    
+
     # Update episode state with final results
     mode_controller.episode_state.total_space_freed = total_space_freed
-    
+
     # Get complete episode summary for trajectory
     episode_summary = mode_controller.get_episode_summary()
-    
+
     return {
         "trajectory": episode_summary,  # Complete mode execution history
         "prompt_responses": all_prompt_responses,  # All orchestrator + mode conversations
         "space_freed_kb": total_space_freed,
         "success": total_space_freed > 0.0,
         "episode_id": episode_id,
-        "action_count": len(mode_controller.episode_state.mode_history)
+        "action_count": len(mode_controller.episode_state.mode_history),
     }
 
 
 if __name__ == "__main__":
     import sys
+
     config_file_path = "./config/config-container.toml"
     if len(sys.argv) > 1:
         if sys.argv[1].endswith(".toml"):
             config_file_path = sys.argv[1]
-            
+
     main(config_file=config_file_path)
