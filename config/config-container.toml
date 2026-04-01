@@ -1,6 +1,7 @@
 dev = true
-model_name = "vllm"
-code_host_cache_path = "./code/Your-Model-Name/code/"
+model_name = "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
+gpu_memory_utilization = 0.85
+code_host_cache_path = "./code/zero-one/code/"
 container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]
 main_container_idx = 0
 
@@ -8,7 +9,7 @@ main_container_idx = 0
 dynamic_container = true
 docker_compose_dir = "./docker/special-learn-compose"  
 
-train_data_save_folder = "./data/Your-Model-Name/multi-container/train_data"
+train_data_save_folder = "./data/zero-one/multi-container/train_data"
 
 [special_egc]
 count = 1

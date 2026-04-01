@@ -52,5 +52,5 @@ class VllmConfig:
     max_tokens: int = 4096
     temperature: float = 0.7
     top_p: float = 0.9
+    gpu_memory_utilization: float = 0.85
     timeout: int = 60
-

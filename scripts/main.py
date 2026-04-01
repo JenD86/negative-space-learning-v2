@@ -1,10 +1,15 @@
+import atexit
 import subprocess
 from pathlib import Path
+import shutil
 import sys
 import json
 import random
 from datetime import datetime
 import time
+import tempfile
+import urllib.request
+from urllib.parse import urlparse
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -54,6 +59,202 @@ RUN_ID = generate_readable_run_id()
 COMMIT_ID = get_formatted_repo_info()
 
 
+def _is_http_ready(url: str, timeout_sec: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _is_gguf_model(model: str) -> bool:
+    return "gguf" in model.lower() or model.lower().endswith(".gguf")
+
+
+def _normalize_vllm_model(model: str) -> str:
+    normalized_model = model.strip()
+    legacy_model_aliases = {
+        "qwen2.5-coder:7b-instruct": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "qwen2.5:7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+    }
+    return legacy_model_aliases.get(normalized_model, normalized_model)
+
+
+def _build_vllm_command(
+    model: str, host: str, port: int, gpu_memory_utilization: float
+) -> List[str]:
+    vllm_bin = shutil.which("vllm")
+    gpu_memory_utilization_arg = str(gpu_memory_utilization)
+    extra_args: List[str] = []
+    if _is_gguf_model(model):
+        extra_args.extend(["--quantization", "gguf"])
+    if vllm_bin:
+        return [
+            vllm_bin,
+            "serve",
+            model,
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--gpu-memory-utilization",
+            gpu_memory_utilization_arg,
+            *extra_args,
+        ]
+    return [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--gpu-memory-utilization",
+        gpu_memory_utilization_arg,
+        *extra_args,
+    ]
+
+
+def _terminate_process(process: subprocess.Popen, name: str) -> None:
+    if process.poll() is not None:
+        return
+
+    logger.info(f"Stopping {name} process (pid={process.pid})...")
+    process.terminate()
+    try:
+        process.wait(timeout=1000)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"{name} did not stop in time. Killing process {process.pid}...")
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _wait_for_vllm_ready(
+    models_url: str,
+    process: subprocess.Popen,
+    timeout_s: int,
+    command: List[str],
+    stderr_log_path: Optional[str] = None,
+) -> None:
+    deadline = time.time() + timeout_s
+    last_output_size = 0
+    last_output_change_time = time.time()
+    freeze_threshold = 60  # seconds without output change = likely frozen
+
+    while time.time() < deadline:
+        if _is_http_ready(models_url):
+            return
+
+        if process.poll() is not None:
+            raise RuntimeError(
+                "vLLM process exited before becoming ready "
+                f"(code={process.returncode}, command={' '.join(command)})"
+            )
+
+        if stderr_log_path:
+            try:
+                current_size = Path(stderr_log_path).stat().st_size
+                if current_size != last_output_size:
+                    last_output_size = current_size
+                    last_output_change_time = time.time()
+                else:
+                    # TODO: modify so this doesn't spam.
+                    seconds_silent = time.time() - last_output_change_time
+                    if seconds_silent > freeze_threshold:
+                        recent_lines = _get_recent_log_lines(stderr_log_path, n=15)
+                        logger.warning(
+                            f"vLLM appears frozen (no output change for {seconds_silent:.0f}s). "
+                            f"Recent log:\n{recent_lines}"
+                        )
+
+            except FileNotFoundError:
+                pass
+
+        time.sleep(1)
+
+    raise TimeoutError(
+        f"Timed out waiting for vLLM readiness at {models_url} after {timeout_s}s"
+    )
+
+
+def _get_recent_log_lines(log_path: str, n: int = 15) -> str:
+    try:
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+            return "".join(lines[-n:])
+    except Exception as e:
+        return f"(could not read log: {e})"
+
+
+def start_or_get_vllm_client(vllm_config):
+    from openai import OpenAI
+
+    configured_model = vllm_config.model
+    resolved_model = _normalize_vllm_model(configured_model)
+    if resolved_model != configured_model.strip():
+        logger.info(
+            f"Resolved vLLM model alias '{configured_model}' to '{resolved_model}'"
+        )
+    vllm_config.model = resolved_model
+
+    endpoint = vllm_config.endpoint.rstrip("/")
+    base_url = endpoint if endpoint.endswith("/v1") else f"{endpoint}/v1"
+    models_url = f"{base_url}/models"
+    api_key = vllm_config.api_key or "dummy"
+
+    if _is_http_ready(models_url):
+        logger.info(f"Using existing vLLM server at {base_url}")
+        return OpenAI(api_key=api_key, base_url=base_url)
+
+    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8000
+    command = _build_vllm_command(
+        vllm_config.model,
+        host,
+        port,
+        vllm_config.gpu_memory_utilization,
+    )
+
+    logger.info(
+        f"No vLLM server detected at {base_url}. Starting subprocess for "
+        f"{vllm_config.model} on {host}:{port}..."
+    )
+    logger.info(f"vLLM command: {' '.join(command)}")
+
+    stderr_log = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=f"vllm_stderr_{resolved_model.replace('/', '_')}_",
+        suffix=".log",
+        delete=False,
+    )
+    stderr_log_path = stderr_log.name
+    stderr_log.close()
+    logger.info(f"vLLM stderr log: {stderr_log_path}")
+
+    with open(stderr_log_path, "a") as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+    atexit.register(_terminate_process, process, "vLLM")
+
+    startup_timeout = max(vllm_config.timeout, 500)
+    try:
+        _wait_for_vllm_ready(
+            models_url, process, startup_timeout, command, stderr_log_path
+        )
+    except Exception:
+        _terminate_process(process, "vLLM")
+        raise
+
+    logger.info(f"vLLM server is ready at {base_url}")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
 def main(config_file: str = "./config/config-container.toml"):
     logger.info(f"Run ID: {RUN_ID}")
     logger.info(f"Commit ID: {COMMIT_ID}")
@@ -93,12 +294,26 @@ def main(config_file: str = "./config/config-container.toml"):
         genner = get_genner("qwen-peft", qwen_peft_config=qwen_peft_config)
     elif config.model_name.startswith("vllm"):
         from src.genner.config import VllmConfig
-        from openai import OpenAI
 
         vllm_config = VllmConfig()
-        vllm_config.model = config.model_name
+        if config.model_name.startswith("vllm:"):
+            vllm_config.model = config.model_name.split(":", 1)[1].strip()
+        elif config.model_name != "vllm":
+            vllm_config.model = config.model_name
+        vllm_config.gpu_memory_utilization = config.gpu_memory_utilization
         vllm_config.temperature = 0.5
-        oai_client = OpenAI(api_key="dummy", base_url="http://localhost:8000/v1")
+        oai_client = start_or_get_vllm_client(vllm_config)
+
+        logger.info("Running quick inference test...")
+        test_response = oai_client.chat.completions.create(
+            model=vllm_config.model,
+            messages=[{"role": "user", "content": "Who are you?"}],
+            max_tokens=50,
+            temperature=0.5,
+        )
+        test_text = test_response.choices[0].message.content
+        logger.info(f"Inference test response: {test_text}")
+
         genner = get_genner("vllm", vllm_config=vllm_config, oai_client=oai_client)
     elif config.model_name == "claude":
         # Claude API support
@@ -145,15 +360,32 @@ def main(config_file: str = "./config/config-container.toml"):
             return
 
         logger.info(f"Starting containers from {compose_dir}...")
+        cmd = ["docker", "compose", "up", "-d", "--build"]
+        logger.debug(f"Running command: {' '.join(cmd)} (cwd={compose_dir})")
         result = subprocess.run(
-            ["docker", "compose", "up", "-d", "--build"],
+            cmd,
             cwd=str(compose_dir),
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            logger.error(f"Failed to start containers: {result.stderr}")
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            logger.error(
+                f"Docker compose failed (returncode={result.returncode})\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"Working dir: {compose_dir}\n"
+                f"--- stdout ---\n{stdout or '<empty>'}\n"
+                f"--- stderr ---\n{stderr or '<empty>'}"
+            )
+            if "error getting credentials" in stderr.lower():
+                logger.error(
+                    "Detected Docker credential helper issue. "
+                    "In WSL, remove credsStore from ~/.docker/config.json (set it to {})."
+                )
             return
+        if result.stdout.strip():
+            logger.debug(f"Docker compose stdout:\n{result.stdout}")
         logger.info("Containers started, waiting for them to be ready...")
 
     containers = []

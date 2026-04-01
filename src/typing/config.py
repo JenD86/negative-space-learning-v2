@@ -5,6 +5,7 @@ from pydantic import BaseModel
 class AppConfig(BaseModel):
     dev: bool
     model_name: str
+    gpu_memory_utilization: float = 0.85
     code_host_cache_path: str
     container_ids: List[str]
     main_container_idx: int
