@@ -50,7 +50,8 @@ def _build_llama_config(
     config.endpoint = endpoint
     config.timeout = timeout
     config.gpu_memory_utilization = app_config.gpu_memory_utilization
-    config.temperature = 0.5
+    config.temperature = app_config.inference.temperature
+    config.max_tokens = app_config.inference.max_tokens
     return config
 
 

@@ -21,8 +21,8 @@ def setup_claude(app_config: AppConfig) -> Iterator[BackendSession]:
     claude_client = anthropic.Anthropic(api_key=claude_api_key)
     claude_config = ClaudeConfig(
         model="claude-sonnet-4-6",
-        max_tokens=2000,
-        temperature=0.3,
+        max_tokens=app_config.inference.max_tokens,
+        temperature=app_config.inference.temperature,
     )
     genner = get_genner(
         "claude",
