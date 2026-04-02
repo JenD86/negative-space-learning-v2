@@ -36,7 +36,9 @@ def _is_gguf_model(model: str) -> bool:
     return "gguf" in model.lower() or model.lower().endswith(".gguf")
 
 
-def _build_llama_config(app_config: AppConfig, endpoint: str, timeout: int) -> VllmConfig:
+def _build_llama_config(
+    app_config: AppConfig, endpoint: str, timeout: int
+) -> VllmConfig:
     if not app_config.model_name.startswith("llama:"):
         raise ValueError(
             f"setup_llama() requires a llama-prefixed model_name, got '{app_config.model_name}'"
@@ -115,7 +117,8 @@ def _download_gguf_model(repo_id: str) -> Path:
     if not gguf_files:
         raise RuntimeError(f"No GGUF files found in {repo_id}")
 
-    preferred_order = ["q4_k_m", "q5_k_m", "q8_0", "q4_k_s", "q5_k_s", "q2_k", "q3_k_m"]
+    # preferred_order = ["q4_k_m", "q5_k_m", "q8_0", "q4_k_s", "q5_k_s", "q2_k", "q3_k_m"]
+    preferred_order = ["q8_0", "q4_k_m"]
     selected = None
     for suffix in preferred_order:
         for f in gguf_files:
@@ -210,7 +213,7 @@ def _build_llama_session(
     stderr_log_path: Optional[str] = None,
     process: Optional[subprocess.Popen] = None,
 ) -> LlamaBackendSession:
-    genner = get_genner("vllm", vllm_config=config, oai_client=client)
+    genner = get_genner("llama", vllm_config=config, oai_client=client)
     return LlamaBackendSession(
         genner=genner,
         smoke_test=_build_llama_smoke_test(client, config),
@@ -303,7 +306,9 @@ def setup_llama(
             )
 
         startup_timeout = max(config.timeout, timeout)
-        _wait_for_llama_server_ready(models_url, process, startup_timeout, stderr_log_path)
+        _wait_for_llama_server_ready(
+            models_url, process, startup_timeout, stderr_log_path
+        )
 
         logger.info(f"llama-server is ready at {base_url}")
         yield _build_llama_session(

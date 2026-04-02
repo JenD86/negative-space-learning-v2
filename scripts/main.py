@@ -127,6 +127,8 @@ def main(config_file: str = "./config/config-container.toml"):
         "run_id": RUN_ID,
         "commit_id": COMMIT_ID,
         "config": config_file,
+        "hardware_tags": list(config.observability.hardware_tags),
+        "load_tags": list(config.observability.load_tags),
         "initial_env_info": {},
         "exploration": [],
         "strategy_generation": [],

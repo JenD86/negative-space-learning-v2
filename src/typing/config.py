@@ -46,6 +46,8 @@ class AppConfig(BaseModel):
         record_phases: bool = True
         record_resources: bool = True
         metrics_output_path: Optional[str] = None
+        hardware_tags: List[str] = Field(default_factory=list)
+        load_tags: List[str] = Field(default_factory=list)
 
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 

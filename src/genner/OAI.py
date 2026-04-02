@@ -47,8 +47,13 @@ class OAIConfig(NamedTuple):
 
 
 class OAIGenner(Genner):
-    def __init__(self, client: OpenAI, config: OAICompatibleConfig):
-        super().__init__("oai")
+    def __init__(
+        self,
+        client: OpenAI,
+        config: OAICompatibleConfig,
+        identifier: str = "oai",
+    ):
+        super().__init__(identifier)
 
         self.client = client
         self.config = config

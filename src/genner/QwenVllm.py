@@ -10,8 +10,8 @@ from .config import VllmConfig
 
 
 class QwenVllmGenner(OAIGenner):
-    def __init__(self, client, config: VllmConfig):
-        super().__init__(client, config)
+    def __init__(self, client, config: VllmConfig, identifier: str = "vllm"):
+        super().__init__(client, config, identifier=identifier)
 
     @staticmethod
     def extract_code(response: str) -> Result[str, str]:

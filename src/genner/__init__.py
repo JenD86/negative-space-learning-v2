@@ -6,6 +6,7 @@ from .config import (
 from .Base import Genner
 from .Qwen import QwenGenner
 from .QwenVllm import QwenVllmGenner
+from .Llama import LlamaGenner
 from .Dream import DreamGenner
 from .Claude import ClaudeGenner, ClaudeConfig
 from openai import OpenAI
@@ -64,6 +65,9 @@ def get_genner(
         "qwen-cleanup-merged",
         "wizardcoder",
         "oai",
+        "vllm",
+        "llama",
+        "dream",
         "claude",
     ]
 
@@ -89,6 +93,14 @@ def get_genner(
         if vllm_config is None:
             vllm_config = VllmConfig()
         return QwenVllmGenner(oai_client, vllm_config)
+    elif backend == "llama":
+        if not oai_client:
+            raise Exception(
+                "Using backend 'llama', OpenAI client is required for llama backend"
+            )
+        if vllm_config is None:
+            vllm_config = VllmConfig()
+        return LlamaGenner(oai_client, vllm_config)
     elif backend == "dream":
         return DreamGenner(dream_config)
     elif backend == "claude":

@@ -79,6 +79,18 @@ def analyze_paths(paths: Sequence[str | Path]) -> dict[str, Any]:
             "generation_benchmarks_by_backend": build_generation_benchmarks_by_backend_table(
                 all_inference_records
             ),
+            "generation_benchmarks_by_hardware_tag": build_generation_benchmarks_by_tag_table(
+                all_inference_records,
+                run_metadata,
+                tag_metadata_key="hardware_tags",
+                tag_output_key="hardware_tag",
+            ),
+            "generation_benchmarks_by_load_tag": build_generation_benchmarks_by_tag_table(
+                all_inference_records,
+                run_metadata,
+                tag_metadata_key="load_tags",
+                tag_output_key="load_tag",
+            ),
         },
     }
 
@@ -113,6 +125,12 @@ def load_run_metadata(paths: Sequence[str | Path]) -> dict[str, dict[str, Any]]:
             value = payload.get(key)
             if value not in (None, ""):
                 current[key] = value
+        for key in ("hardware_tags", "load_tags"):
+            value = _normalize_tags(payload.get(key))
+            if value:
+                current[key] = value
+            elif key not in current:
+                current[key] = []
     return metadata_by_run
 
 
@@ -168,6 +186,8 @@ def summarize_run(
         if _has_number(record.get("gpu_memory_mb"))
     ]
 
+    hardware_tags = _normalize_tags(metadata.get("hardware_tags"))
+    load_tags = _normalize_tags(metadata.get("load_tags"))
     backend = infer_backend(inference_records)
     model = infer_model(inference_records)
 
@@ -175,6 +195,8 @@ def summarize_run(
         "run_id": run_id,
         "commit_id": metadata.get("commit_id", "unknown"),
         "config": metadata.get("config", "unknown"),
+        "hardware_tags": hardware_tags,
+        "load_tags": load_tags,
         "backend": backend,
         "model": model,
         "inference_calls": inference_calls,
@@ -323,40 +345,68 @@ def build_generation_benchmarks_by_backend_table(
 
     rows: list[dict[str, Any]] = []
     for backend, records in sorted(grouped.items()):
-        prompt_rates = _collect_generation_rates(records, "prompt_tokens_per_second")
-        output_rates = _collect_generation_rates(records, "output_tokens_per_second")
-        total_rates = _collect_generation_rates(records, "total_tokens_per_second")
-        latency_samples = [
-            _as_float(record.get("latency_ms"))
-            for record in records
-            if _has_number(record.get("latency_ms"))
-        ]
-        rows.append(
-            {
-                "backend": backend,
-                "run_count": len({str(record.get("run_id")) for record in records if record.get("run_id")}),
-                "inference_call_count": len(records),
-                "generation_count": len(total_rates),
-                "success_rate": (
-                    sum(1 for record in records if record.get("success")) / len(records)
-                    if records
-                    else 0.0
-                ),
-                "average_latency_ms": _average_or_zero(latency_samples),
-                "median_latency_ms": _median_or_none(latency_samples),
-                "p95_latency_ms": _percentile_or_none(latency_samples, 95.0),
-                "average_prompt_tokens_per_second": _average_or_zero(prompt_rates),
-                "median_prompt_tokens_per_second": _median_or_none(prompt_rates),
-                "peak_prompt_tokens_per_second": max(prompt_rates) if prompt_rates else None,
-                "average_output_tokens_per_second": _average_or_zero(output_rates),
-                "median_output_tokens_per_second": _median_or_none(output_rates),
-                "peak_output_tokens_per_second": max(output_rates) if output_rates else None,
-                "average_total_tokens_per_second": _average_or_zero(total_rates),
-                "median_total_tokens_per_second": _median_or_none(total_rates),
-                "peak_total_tokens_per_second": max(total_rates) if total_rates else None,
-            }
-        )
+        row = _build_generation_benchmark_row(records)
+        row["backend"] = backend
+        rows.append(row)
     return rows
+
+
+def build_generation_benchmarks_by_tag_table(
+    inference_records: Sequence[dict[str, Any]],
+    run_metadata: dict[str, dict[str, Any]],
+    tag_metadata_key: str,
+    tag_output_key: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in inference_records:
+        run_id = record.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        tags = _normalize_tags(run_metadata.get(run_id, {}).get(tag_metadata_key))
+        for tag in tags:
+            grouped[tag].append(record)
+
+    rows: list[dict[str, Any]] = []
+    for tag, records in sorted(grouped.items()):
+        row = _build_generation_benchmark_row(records)
+        row[tag_output_key] = tag
+        rows.append(row)
+    return rows
+
+
+def _build_generation_benchmark_row(
+    records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    prompt_rates = _collect_generation_rates(records, "prompt_tokens_per_second")
+    output_rates = _collect_generation_rates(records, "output_tokens_per_second")
+    total_rates = _collect_generation_rates(records, "total_tokens_per_second")
+    latency_samples = [
+        _as_float(record.get("latency_ms"))
+        for record in records
+        if _has_number(record.get("latency_ms"))
+    ]
+    return {
+        "run_count": len({str(record.get("run_id")) for record in records if record.get("run_id")}),
+        "inference_call_count": len(records),
+        "generation_count": len(total_rates),
+        "success_rate": (
+            sum(1 for record in records if record.get("success")) / len(records)
+            if records
+            else 0.0
+        ),
+        "average_latency_ms": _average_or_zero(latency_samples),
+        "median_latency_ms": _median_or_none(latency_samples),
+        "p95_latency_ms": _percentile_or_none(latency_samples, 95.0),
+        "average_prompt_tokens_per_second": _average_or_zero(prompt_rates),
+        "median_prompt_tokens_per_second": _median_or_none(prompt_rates),
+        "peak_prompt_tokens_per_second": max(prompt_rates) if prompt_rates else None,
+        "average_output_tokens_per_second": _average_or_zero(output_rates),
+        "median_output_tokens_per_second": _median_or_none(output_rates),
+        "peak_output_tokens_per_second": max(output_rates) if output_rates else None,
+        "average_total_tokens_per_second": _average_or_zero(total_rates),
+        "median_total_tokens_per_second": _median_or_none(total_rates),
+        "peak_total_tokens_per_second": max(total_rates) if total_rates else None,
+    }
 
 
 def infer_backend(inference_records: Sequence[dict[str, Any]]) -> str:
@@ -422,6 +472,7 @@ def render_text_report(report: dict[str, Any]) -> str:
         lines.append(
             " - "
             f"{run['run_id']} | backend={run['backend']} | model={run['model']} | commit={run['commit_id']} | "
+            f"hardware_tags={_format_tags(run['hardware_tags'])} | load_tags={_format_tags(run['load_tags'])} | "
             f"inference_calls={run['inference_calls']} | avg_latency_ms={run['average_inference_latency_ms']:.2f} | "
             f"avg_total_tok_s={run['average_total_tokens_per_second']:.2f}"
         )
@@ -442,6 +493,24 @@ def render_text_report(report: dict[str, Any]) -> str:
             f"avg_output_tok_s={row['average_output_tokens_per_second']:.2f} | "
             f"avg_total_tok_s={row['average_total_tokens_per_second']:.2f} | "
             f"median_total_tok_s={_format_optional_float(row['median_total_tokens_per_second'])} | "
+            f"p95_latency_ms={_format_optional_float(row['p95_latency_ms'])}"
+        )
+    lines.append("")
+    lines.append("Generation benchmarks by hardware tag")
+    for row in report["comparison_tables"]["generation_benchmarks_by_hardware_tag"]:
+        lines.append(
+            " - "
+            f"{row['hardware_tag']} | runs={row['run_count']} | generations={row['generation_count']} | "
+            f"avg_total_tok_s={row['average_total_tokens_per_second']:.2f} | "
+            f"p95_latency_ms={_format_optional_float(row['p95_latency_ms'])}"
+        )
+    lines.append("")
+    lines.append("Generation benchmarks by load tag")
+    for row in report["comparison_tables"]["generation_benchmarks_by_load_tag"]:
+        lines.append(
+            " - "
+            f"{row['load_tag']} | runs={row['run_count']} | generations={row['generation_count']} | "
+            f"avg_total_tok_s={row['average_total_tokens_per_second']:.2f} | "
             f"p95_latency_ms={_format_optional_float(row['p95_latency_ms'])}"
         )
     lines.append("")
@@ -500,6 +569,23 @@ def _usage(record: dict[str, Any]) -> dict[str, Any]:
     if isinstance(usage, dict):
         return usage
     return {}
+
+
+def _normalize_tags(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        tag = item.strip()
+        if not tag or tag in seen:
+            continue
+        normalized.append(tag)
+        seen.add(tag)
+    return normalized
 
 
 def _collect_generation_rates(
@@ -610,6 +696,13 @@ def _format_optional_float(value: Any) -> str:
     if value is None:
         return "n/a"
     return f"{float(value):.2f}"
+
+
+def _format_tags(tags: Any) -> str:
+    normalized = _normalize_tags(tags)
+    if not normalized:
+        return "n/a"
+    return ",".join(normalized)
 
 
 if __name__ == "__main__":
