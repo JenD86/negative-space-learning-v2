@@ -41,6 +41,7 @@ from src.helper import (
     string_hash,
     unflatten_toml_dict,
 )
+from src.observability import MetricsCollector, MetricsGenner, PhaseMetric
 from src.tool.code import validate_code_offline
 from src.tool.docker import (
     get_container_free_disk_space_kb_v1,
@@ -59,6 +60,43 @@ from src.typing.training import (
 
 RUN_ID = generate_readable_run_id()
 COMMIT_ID = get_formatted_repo_info()
+
+
+def _build_metrics_collector(config: AppConfig) -> MetricsCollector:
+    output_dir = (
+        config.observability.metrics_output_path or config.train_data_save_folder
+    )
+    return MetricsCollector(
+        run_id=RUN_ID,
+        output_dir=output_dir,
+        enabled=config.observability.enabled,
+        record_inference=config.observability.record_inference,
+        record_phases=config.observability.record_phases,
+        record_resources=config.observability.record_resources,
+    )
+
+
+def _record_phase_metric(
+    collector: MetricsCollector,
+    phase_name: str,
+    duration_ms: float,
+    success: bool,
+    episode_id: Optional[str] = None,
+    retry_count: int = 0,
+    error_message: Optional[str] = None,
+) -> Optional[str]:
+    collector.record_phase_safe(
+        PhaseMetric(
+            phase_name=phase_name,
+            run_id=collector.run_id,
+            episode_id=episode_id,
+            duration_ms=duration_ms,
+            success=success,
+            retry_count=retry_count,
+            error_message=error_message,
+        )
+    )
+    return collector.flush()
 
 def _run_backend_smoke_test(backend_session) -> None:
     smoke_test = getattr(backend_session, "smoke_test", None)
@@ -82,6 +120,9 @@ def main(config_file: str = "./config/config-container.toml"):
         logger.info(f"Config validation error: {e}")
         return
 
+    metrics_collector = _build_metrics_collector(config)
+    metrics_output_path: Optional[str] = None
+
     full_run_data = {
         "run_id": RUN_ID,
         "commit_id": COMMIT_ID,
@@ -90,6 +131,8 @@ def main(config_file: str = "./config/config-container.toml"):
         "exploration": [],
         "strategy_generation": [],
         "strategy_execution": [],
+        "metrics_summary": {},
+        "metrics_path": None,
     }
 
     docker_client = docker.from_env()
@@ -126,6 +169,8 @@ def main(config_file: str = "./config/config-container.toml"):
         backend_session = backend_stack.enter_context(backend_context)
         _run_backend_smoke_test(backend_session)
         genner = backend_session.genner
+
+    genner = MetricsGenner(genner, metrics_collector)
 
     # Start containers dynamically if configured
     if config.dynamic_container:
@@ -213,7 +258,31 @@ def main(config_file: str = "./config/config-container.toml"):
         logger.info("Using NSL v2 episode-based execution")
 
         # Run v2 episode-based execution
-        episode_result = run_episode_v2(genner, docker_client, containers, config)
+        episode_started_at = time.perf_counter()
+        try:
+            episode_result = run_episode_v2(genner, docker_client, containers, config)
+        except Exception as exc:
+            metrics_output_path = (
+                _record_phase_metric(
+                    metrics_collector,
+                    "episode_v2",
+                    (time.perf_counter() - episode_started_at) * 1000,
+                    False,
+                    error_message=str(exc),
+                )
+                or metrics_output_path
+            )
+            raise
+        metrics_output_path = (
+            _record_phase_metric(
+                metrics_collector,
+                "episode_v2",
+                (time.perf_counter() - episode_started_at) * 1000,
+                episode_result["success"],
+                episode_id=episode_result["episode_id"],
+            )
+            or metrics_output_path
+        )
 
         # Extract results for compatibility with existing data_collector interface
         space_freed_kb = episode_result["space_freed_kb"]
@@ -252,10 +321,21 @@ def main(config_file: str = "./config/config-container.toml"):
         logger.info("Using NSL v1 fixed pipeline execution")
 
         # Fall back to v1 execution (existing code)
+        exploration_started_at = time.perf_counter()
         sp_env_infos, sp_egc_train_data, sp_env_info_hashes = (
             special_environment_getter_code_flow(
                 genner, docker_client, containers, config, env_infos
             )
+        )
+        metrics_output_path = (
+            _record_phase_metric(
+                metrics_collector,
+                "special_environment_getter_code",
+                (time.perf_counter() - exploration_started_at) * 1000,
+                True,
+                retry_count=max(0, len(sp_egc_train_data) - len(sp_env_infos)),
+            )
+            or metrics_output_path
         )
         save_train_data(
             "special_environment_getter_code",
@@ -268,8 +348,19 @@ def main(config_file: str = "./config/config-container.toml"):
         logger.info(f"Special environment infos: \n{sp_env_infos}")
         logger.info(f"`len(sp_egc_train_data)`: {len(sp_egc_train_data)}")
 
+        strategy_list_started_at = time.perf_counter()
         strategies, strategy_list_train_data, strategies_hash = strategy_list_flow(
             genner, config, env_infos, sp_env_infos, sp_env_info_hashes
+        )
+        metrics_output_path = (
+            _record_phase_metric(
+                metrics_collector,
+                "strategy_list",
+                (time.perf_counter() - strategy_list_started_at) * 1000,
+                True,
+                retry_count=max(0, len(strategy_list_train_data) - 1),
+            )
+            or metrics_output_path
         )
         save_train_data(
             "strategy_list", strategy_list_train_data, config.train_data_save_folder
@@ -286,6 +377,7 @@ def main(config_file: str = "./config/config-container.toml"):
             strategy_to_run = random.choice(strategies)
             logger.info(f"Executing ONE random strategy: {strategy_to_run}")
 
+            strategy_code_started_at = time.perf_counter()
             strat_code, strat_code_hash, strat_code_train_data, space_freed_kb = (
                 strategy_code_flow(
                     genner,
@@ -299,6 +391,16 @@ def main(config_file: str = "./config/config-container.toml"):
                     sp_env_infos,
                     sp_env_info_hashes,
                 )
+            )
+            metrics_output_path = (
+                _record_phase_metric(
+                    metrics_collector,
+                    "strategy_code",
+                    (time.perf_counter() - strategy_code_started_at) * 1000,
+                    True,
+                    retry_count=max(0, len(strat_code_train_data) - 1),
+                )
+                or metrics_output_path
             )
 
             strategy_execution_data = {
@@ -319,6 +421,10 @@ def main(config_file: str = "./config/config-container.toml"):
             full_run_data["strategy_execution"].append(strategy_execution_data)
             logger.info(f"Strategy code: \n{strat_code}")
             print(f"Space freed: {space_freed_kb} KB")
+
+    metrics_output_path = metrics_collector.flush() or metrics_output_path
+    full_run_data["metrics_summary"] = metrics_collector.summary()
+    full_run_data["metrics_path"] = metrics_output_path
 
     output_json_path = Path(config.train_data_save_folder) / "LAST_RUN_LOG.json"
 
@@ -1039,6 +1145,7 @@ def run_episode_v2(
                 orchestrator_decision.target_mode,
                 orchestrator_decision.instruction,
                 mode_result,
+                orchestrator_duration_ms=orchestrator_decision.duration_ms,
             )
 
             # Handle failures

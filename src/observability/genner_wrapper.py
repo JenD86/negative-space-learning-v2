@@ -39,16 +39,23 @@ class MetricsGenner(Genner):
 
         match result:
             case Ok(inference_result):
+                usage = inference_result.usage
+                generation_rates = self._compute_generation_rates(usage, latency_ms)
                 self.collector.record_inference_safe(
                     InferenceMetric(
                         inference_id=inference_id,
                         run_id=self.collector.run_id,
+                        backend=self.inner.identifier,
                         episode_id=episode_id,
                         phase=phase_name,
                         success=True,
                         content=inference_result.content,
-                        usage=inference_result.usage,
+                        usage=usage,
+                        model=usage.model if usage is not None else None,
                         latency_ms=latency_ms,
+                        prompt_tokens_per_second=generation_rates["prompt_tokens_per_second"],
+                        output_tokens_per_second=generation_rates["output_tokens_per_second"],
+                        total_tokens_per_second=generation_rates["total_tokens_per_second"],
                         gpu_memory_mb=resources.gpu_memory_mb,
                         host_memory_mb=resources.host_memory_mb,
                     )
@@ -59,6 +66,7 @@ class MetricsGenner(Genner):
                     InferenceMetric(
                         inference_id=inference_id,
                         run_id=self.collector.run_id,
+                        backend=self.inner.identifier,
                         episode_id=episode_id,
                         phase=phase_name,
                         success=False,
@@ -117,3 +125,49 @@ class MetricsGenner(Genner):
             return episode_id
 
         return None
+
+    def _compute_generation_rates(
+        self,
+        usage: Optional[UsageInfo],
+        latency_ms: float,
+    ) -> dict[str, Optional[float]]:
+        if usage is None or latency_ms <= 0:
+            return {
+                "prompt_tokens_per_second": None,
+                "output_tokens_per_second": None,
+                "total_tokens_per_second": None,
+            }
+
+        latency_seconds = latency_ms / 1000
+        if latency_seconds <= 0:
+            return {
+                "prompt_tokens_per_second": None,
+                "output_tokens_per_second": None,
+                "total_tokens_per_second": None,
+            }
+
+        prompt_tokens = usage.prompt_tokens
+        completion_tokens = usage.completion_tokens
+        total_tokens = usage.total_tokens
+        if total_tokens is None and (
+            prompt_tokens is not None or completion_tokens is not None
+        ):
+            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+        return {
+            "prompt_tokens_per_second": (
+                float(prompt_tokens) / latency_seconds
+                if prompt_tokens is not None
+                else None
+            ),
+            "output_tokens_per_second": (
+                float(completion_tokens) / latency_seconds
+                if completion_tokens is not None
+                else None
+            ),
+            "total_tokens_per_second": (
+                float(total_tokens) / latency_seconds
+                if total_tokens is not None
+                else None
+            ),
+        }

@@ -22,13 +22,18 @@ class InferenceResult:
 class InferenceMetric:
     inference_id: str
     run_id: str
+    backend: str
     phase: str
     success: bool
     episode_id: Optional[str] = None
     content: Optional[str] = None
     error_message: Optional[str] = None
     usage: Optional[UsageInfo] = None
+    model: Optional[str] = None
     latency_ms: float = 0.0
+    prompt_tokens_per_second: Optional[float] = None
+    output_tokens_per_second: Optional[float] = None
+    total_tokens_per_second: Optional[float] = None
     gpu_memory_mb: Optional[float] = None
     host_memory_mb: Optional[float] = None
 

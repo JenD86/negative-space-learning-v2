@@ -34,6 +34,10 @@ class MetricsCollector:
             "total_input_tokens": 0,
             "total_output_tokens": 0,
             "total_latency_ms": 0.0,
+            "generation_count": 0,
+            "_prompt_tokens_per_second_sum": 0.0,
+            "_output_tokens_per_second_sum": 0.0,
+            "_total_tokens_per_second_sum": 0.0,
         }
 
     @property
@@ -52,6 +56,17 @@ class MetricsCollector:
                 self._summary["total_input_tokens"] += metric.usage.prompt_tokens or 0
                 self._summary["total_output_tokens"] += (
                     metric.usage.completion_tokens or 0
+                )
+            if metric.total_tokens_per_second is not None:
+                self._summary["generation_count"] += 1
+                self._summary["_prompt_tokens_per_second_sum"] += (
+                    metric.prompt_tokens_per_second or 0.0
+                )
+                self._summary["_output_tokens_per_second_sum"] += (
+                    metric.output_tokens_per_second or 0.0
+                )
+                self._summary["_total_tokens_per_second_sum"] += (
+                    metric.total_tokens_per_second or 0.0
                 )
 
     def record_inference_safe(self, metric: InferenceMetric) -> None:
@@ -113,7 +128,29 @@ class MetricsCollector:
 
     def summary(self) -> dict[str, float | int]:
         with self._lock:
-            return dict(self._summary)
+            summary = dict(self._summary)
+
+        generation_count = int(summary["generation_count"])
+        if generation_count > 0:
+            summary["average_prompt_tokens_per_second"] = (
+                float(summary["_prompt_tokens_per_second_sum"]) / generation_count
+            )
+            summary["average_output_tokens_per_second"] = (
+                float(summary["_output_tokens_per_second_sum"]) / generation_count
+            )
+            summary["average_total_tokens_per_second"] = (
+                float(summary["_total_tokens_per_second_sum"]) / generation_count
+            )
+        else:
+            summary["average_prompt_tokens_per_second"] = 0.0
+            summary["average_output_tokens_per_second"] = 0.0
+            summary["average_total_tokens_per_second"] = 0.0
+
+        del summary["_prompt_tokens_per_second_sum"]
+        del summary["_output_tokens_per_second_sum"]
+        del summary["_total_tokens_per_second_sum"]
+
+        return summary
 
     def _serialize_metrics(
         self,
