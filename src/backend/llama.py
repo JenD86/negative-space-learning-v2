@@ -16,7 +16,7 @@ from openai import OpenAI
 
 from src.backend.utils import get_recent_log_lines, is_http_ready, terminate_process
 from src.genner import get_genner
-from src.genner.config import VllmConfig
+from src.genner.config import LlamaConfig
 from src.typing.config import AppConfig
 
 from .session import BackendSession
@@ -38,18 +38,16 @@ def _is_gguf_model(model: str) -> bool:
 
 def _build_llama_config(
     app_config: AppConfig, endpoint: str, timeout: int
-) -> VllmConfig:
+) -> LlamaConfig:
     if not app_config.model_name.startswith("llama:"):
         raise ValueError(
             f"setup_llama() requires a llama-prefixed model_name, got '{app_config.model_name}'"
         )
 
-    config = VllmConfig()
+    config = LlamaConfig()
     config.model = app_config.model_name.split(":", 1)[1].strip()
-    config.backend = "llama.cpp"
     config.endpoint = endpoint
     config.timeout = timeout
-    config.gpu_memory_utilization = app_config.gpu_memory_utilization
     config.temperature = app_config.inference.temperature
     config.max_tokens = app_config.inference.max_tokens
     return config
@@ -193,7 +191,7 @@ def _wait_for_llama_server_ready(
     )
 
 
-def _build_llama_smoke_test(client: OpenAI, config: VllmConfig):
+def _build_llama_smoke_test(client: OpenAI, config: LlamaConfig):
     def run_smoke_test() -> str:
         test_response = client.chat.completions.create(
             model=config.model,
@@ -208,13 +206,13 @@ def _build_llama_smoke_test(client: OpenAI, config: VllmConfig):
 
 def _build_llama_session(
     client: OpenAI,
-    config: VllmConfig,
+    config: LlamaConfig,
     base_url: str,
     models_url: str,
     stderr_log_path: Optional[str] = None,
     process: Optional[subprocess.Popen] = None,
 ) -> LlamaBackendSession:
-    genner = get_genner("llama", vllm_config=config, oai_client=client)
+    genner = get_genner("llama", server_config=config, oai_client=client)
     return LlamaBackendSession(
         genner=genner,
         smoke_test=_build_llama_smoke_test(client, config),
@@ -233,8 +231,6 @@ def setup_llama(
     *,
     endpoint: str = "http://localhost:8000",
     timeout: int = 500,
-    ctx_size: int = 8192,
-    n_gpu_layers: int = 99,
 ) -> Iterator[LlamaBackendSession]:
     config = _build_llama_config(app_config, endpoint=endpoint, timeout=timeout)
 
@@ -287,11 +283,11 @@ def setup_llama(
         "--port",
         str(port),
         "--ctx-size",
-        str(ctx_size),
+        str(config.ctx_size),
         "--temp",
         str(config.temperature),
         "--n-gpu-layers",
-        str(n_gpu_layers),
+        str(config.n_gpu_layers),
         "--jinja",
     ]
 

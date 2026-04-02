@@ -1,6 +1,8 @@
 from .config import (
     DreamConfig,
+    LlamaConfig,
     QwenConfig,
+    ServerConfig,
     VllmConfig,
 )
 from .Base import Genner
@@ -31,7 +33,7 @@ def get_genner(
     backend: str,
     qwen_config: QwenConfig = QwenConfig(),
     dream_config: DreamConfig = DreamConfig(),
-    vllm_config: VllmConfig | None = None,
+    server_config: ServerConfig | None = None,
     oai_client: OpenAI | None = None,
     claude_config: ClaudeConfig = ClaudeConfig(),
     claude_client: anthropic.Anthropic | None = None,
@@ -40,31 +42,21 @@ def get_genner(
     Get a genner instance based on the backend.
 
     Args:
-        backend (str): The backend to use.
-        deepseek_config (DeepseekConfig, optional): The configuration for the Deepseek backend. Defaults to DeepseekConfig().
-        oai_config (OAIConfig, optional): The configuration for the OpenAI backend. Defaults to OAIConfig().
-        wizard_config (WizardCoderConfig, optional): The configuration for the WizardCoder backend. Defaults to WizardCoderConfig().
-        qwen_config (QwenConfig, optional): The configuration for the Qwen backend. Defaults to QwenConfig().
-        vllm_config (VllmConfig | None, optional): The configuration for the vLLM backend. Defaults to None.
-        claude_config (ClaudeConfig, optional): The configuration for the Claude backend. Defaults to ClaudeConfig().
-        oai_client (OpenAI | None, optional): The OpenAI client. Defaults to None.
-        claude_client (Anthropic | None, optional): The Anthropic client. Defaults to None.
-
-    Raises:
-        BackendException: If the backend is not supported.
-        OaiBackendException: If the OpenAI client is required for the OAI backend but not provided.
-        ClaudeBackendException: If the Anthropic client is required for the Claude backend but not provided.
+        backend: The backend to use.
+        qwen_config: Configuration for the Qwen backend.
+        dream_config: Configuration for the Dream backend.
+        server_config: Configuration for OpenAI-compatible server backends (vllm, llama).
+        oai_client: OpenAI client (required for vllm/llama backends).
+        claude_config: Configuration for the Claude backend.
+        claude_client: Anthropic client (required for Claude backend).
 
     Returns:
         Genner: The genner instance.
     """
     available_backends = [
-        "deepseek",
         "qwen",
         "qwen-finetuned",
         "qwen-cleanup-merged",
-        "wizardcoder",
-        "oai",
         "vllm",
         "llama",
         "dream",
@@ -90,17 +82,17 @@ def get_genner(
             raise Exception(
                 "Using backend 'vllm', OpenAI client is required for vLLM backend"
             )
-        if vllm_config is None:
-            vllm_config = VllmConfig()
-        return QwenVllmGenner(oai_client, vllm_config)
+        if server_config is None:
+            server_config = VllmConfig()
+        return QwenVllmGenner(oai_client, server_config)
     elif backend == "llama":
         if not oai_client:
             raise Exception(
                 "Using backend 'llama', OpenAI client is required for llama backend"
             )
-        if vllm_config is None:
-            vllm_config = VllmConfig()
-        return LlamaGenner(oai_client, vllm_config)
+        if server_config is None:
+            server_config = LlamaConfig()
+        return LlamaGenner(oai_client, server_config)
     elif backend == "dream":
         return DreamGenner(dream_config)
     elif backend == "claude":

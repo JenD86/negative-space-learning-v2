@@ -6,11 +6,11 @@ from typing import List, Tuple
 from result import Result, Ok, Err
 
 from .OAI import OAIGenner
-from .config import VllmConfig
+from .config import ServerConfig
 
 
 class QwenVllmGenner(OAIGenner):
-    def __init__(self, client, config: VllmConfig, identifier: str = "vllm"):
+    def __init__(self, client, config: ServerConfig, identifier: str = "vllm"):
         super().__init__(client, config, identifier=identifier)
 
     @staticmethod

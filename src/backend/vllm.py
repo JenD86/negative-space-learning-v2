@@ -41,7 +41,6 @@ def _build_vllm_config(app_config: AppConfig, endpoint: str, timeout: int) -> Vl
     if resolved_model != config.model.strip():
         logger.info(f"Resolved model alias '{config.model}' to '{resolved_model}'")
     config.model = resolved_model
-    config.backend = "vllm"
     config.endpoint = endpoint
     config.timeout = timeout
     config.gpu_memory_utilization = app_config.gpu_memory_utilization
@@ -163,7 +162,7 @@ def _build_vllm_session(
     stderr_log_path: Optional[str] = None,
     process: Optional[subprocess.Popen] = None,
 ) -> BackendSession:
-    genner = get_genner("vllm", vllm_config=config, oai_client=client)
+    genner = get_genner("vllm", server_config=config, oai_client=client)
     return BackendSession(
         genner=genner,
         smoke_test=_build_vllm_smoke_test(client, config),

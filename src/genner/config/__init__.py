@@ -48,16 +48,31 @@ class DreamConfig(NamedTuple):
 
 
 @dataclass
-class VllmConfig:
-    """Configuration for vLLM-based models."""
+class ServerConfig:
+    """Configuration for OpenAI-compatible inference servers."""
 
-    name: str = "vllm qwen"
+    name: str = "server"
     model: str = "qwen2.5-coder:7b-instruct"
-    backend: str = "auto"  # "vllm", "llama.cpp", or "auto"
     endpoint: str = "http://localhost:8000"
     api_key: Optional[str] = None
     max_tokens: int = 4096
     temperature: float = 0.7
     top_p: float = 0.9
-    gpu_memory_utilization: float = 0.85
     timeout: int = 60
+
+
+@dataclass
+class VllmConfig(ServerConfig):
+    """Configuration for vLLM-based models."""
+
+    name: str = "vllm qwen"
+    gpu_memory_utilization: float = 0.85
+
+
+@dataclass
+class LlamaConfig(ServerConfig):
+    """Configuration for llama.cpp-based models."""
+
+    name: str = "llama"
+    n_gpu_layers: int = 99
+    ctx_size: int = 8192
