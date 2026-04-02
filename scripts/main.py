@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pydantic
 from loguru import logger
@@ -57,6 +57,8 @@ from src.typing.training import (
     save_train_data,
 )
 
+RUN_ID = generate_readable_run_id()
+COMMIT_ID = get_formatted_repo_info()
 
 def _run_backend_smoke_test(backend_session) -> None:
     smoke_test = getattr(backend_session, "smoke_test", None)
@@ -225,12 +227,12 @@ def main(config_file: str = "./config/config-container.toml"):
                 {
                     "run_id": RUN_ID,
                     "version": COMMIT_ID,
-                    "prompt": prompt_resp.prompt,
-                    "raw_response": prompt_resp.raw_response,
-                    "interaction_type": prompt_resp.interaction_type,
-                    "timestamp": prompt_resp.timestamp,
-                    "success": prompt_resp.success,
-                    "error_message": prompt_resp.error_message,
+                    "prompt": prompt_resp["prompt"],
+                    "raw_response": prompt_resp["raw_response"],
+                    "interaction_type": prompt_resp["interaction_type"],
+                    "timestamp": prompt_resp["timestamp"],
+                    "success": prompt_resp["success"],
+                    "error_message": prompt_resp["error_message"],
                 }
             )
 
@@ -915,7 +917,6 @@ def strategy_code_flow(
                 error_contexts.append(error_message)
                 error_sources.append("code_run")
 
-                continue
 
     logger.info(f"Strategy code completed on strat \n{strategy}.")
     logger.info(f"Strategy code train data: {strat_code_train_data}")
@@ -935,7 +936,7 @@ def run_episode_v2(
     docker_client: docker.DockerClient,
     containers: List[DockerContainer],
     config: AppConfig,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Unified mode system with orchestrator → mode delegation."""
 
     # Initialize ModeController (replaces AgentV2)

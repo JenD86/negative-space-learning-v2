@@ -9,8 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-.nix
 *.lock
+.env
 
 data/
 code/
