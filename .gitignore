@@ -9,5 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
+.nix
+*.lock
+
 data/
 code/
+
+# llama.cpp binary
+.llama/
+
+# Model cache
+.model-cache/

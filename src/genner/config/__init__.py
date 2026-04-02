@@ -10,18 +10,22 @@ class OllamaConfig(ABC, BaseModel):
     model: str
     stream: bool
 
+
 class QwenConfig(OllamaConfig):
     name: str = "Ollama Qwen"
     model: str = "qwen-cleanup-merged:latest"
     _model_uncensored: str = "qwen-uncensored:latest"
     stream: bool = False
 
+
 class QwenPeftConfig(BaseModel):
     """Configuration for PEFT-based Qwen model."""
+
     name: str = "Qwen PEFT"
     base_model_path: str = "Qwen/Qwen2.5-7B-Instruct"
     checkpoint_path: str
     device: str = "auto"
+
 
 class DreamConfig(NamedTuple):
     """Configuration for the Dream API generator."""
@@ -42,11 +46,14 @@ class DreamConfig(NamedTuple):
     alg: str = "origin"
     alg_temp: float = 0.3
 
+
 @dataclass
 class VllmConfig:
     """Configuration for vLLM-based models."""
+
     name: str = "vllm qwen"
     model: str = "qwen2.5-coder:7b-instruct"
+    backend: str = "auto"  # "vllm", "llama.cpp", or "auto"
     endpoint: str = "http://localhost:8000"
     api_key: Optional[str] = None
     max_tokens: int = 4096

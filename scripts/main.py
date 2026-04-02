@@ -1,14 +1,15 @@
 import atexit
-import subprocess
-from pathlib import Path
 import shutil
+import subprocess
 import sys
 import json
 import random
+import platform
+import tempfile
 from datetime import datetime
 import time
-import tempfile
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlparse
 
 project_root = Path(__file__).parent.parent
@@ -57,6 +58,12 @@ from src.typing.training import (
 
 RUN_ID = generate_readable_run_id()
 COMMIT_ID = get_formatted_repo_info()
+
+LLAMA_CPP_TAG = "b8606"
+LLAMA_DIR = project_root / ".llama"
+LLAMA_SERVER_BIN = LLAMA_DIR / "llama-server"
+
+MODEL_CACHE_DIR = project_root / ".model-cache"
 
 
 def _is_http_ready(url: str, timeout_sec: float = 2.0) -> bool:
@@ -117,20 +124,6 @@ def _build_vllm_command(
     ]
 
 
-def _terminate_process(process: subprocess.Popen, name: str) -> None:
-    if process.poll() is not None:
-        return
-
-    logger.info(f"Stopping {name} process (pid={process.pid})...")
-    process.terminate()
-    try:
-        process.wait(timeout=1000)
-    except subprocess.TimeoutExpired:
-        logger.warning(f"{name} did not stop in time. Killing process {process.pid}...")
-        process.kill()
-        process.wait(timeout=5)
-
-
 def _wait_for_vllm_ready(
     models_url: str,
     process: subprocess.Popen,
@@ -141,7 +134,7 @@ def _wait_for_vllm_ready(
     deadline = time.time() + timeout_s
     last_output_size = 0
     last_output_change_time = time.time()
-    freeze_threshold = 60  # seconds without output change = likely frozen
+    freeze_threshold = 60
 
     while time.time() < deadline:
         if _is_http_ready(models_url):
@@ -160,7 +153,6 @@ def _wait_for_vllm_ready(
                     last_output_size = current_size
                     last_output_change_time = time.time()
                 else:
-                    # TODO: modify so this doesn't spam.
                     seconds_silent = time.time() - last_output_change_time
                     if seconds_silent > freeze_threshold:
                         recent_lines = _get_recent_log_lines(stderr_log_path, n=15)
@@ -168,7 +160,6 @@ def _wait_for_vllm_ready(
                             f"vLLM appears frozen (no output change for {seconds_silent:.0f}s). "
                             f"Recent log:\n{recent_lines}"
                         )
-
             except FileNotFoundError:
                 pass
 
@@ -176,6 +167,161 @@ def _wait_for_vllm_ready(
 
     raise TimeoutError(
         f"Timed out waiting for vLLM readiness at {models_url} after {timeout_s}s"
+    )
+
+
+def _ensure_llama_server() -> Path:
+    in_path = shutil.which("llama-server")
+    if in_path:
+        logger.info(f"llama-server found on PATH at {in_path}")
+        return Path(in_path)
+
+    if LLAMA_SERVER_BIN.exists():
+        logger.info(f"llama-server found at {LLAMA_SERVER_BIN}")
+        return LLAMA_SERVER_BIN
+
+    logger.info(f"Downloading llama-server {LLAMA_CPP_TAG}...")
+    LLAMA_DIR.mkdir(parents=True, exist_ok=True)
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if system == "linux" and machine in ("x86_64", "amd64"):
+        asset_name = f"llama-{LLAMA_CPP_TAG}-bin-ubuntu-x64.tar.gz"
+    else:
+        raise RuntimeError(
+            f"Unsupported platform: {system}/{machine}. "
+            f"Install llama-cpp via your package manager (e.g., nixpkgs#llama-cpp) "
+            f"or download a binary from "
+            f"https://github.com/ggml-org/llama.cpp/releases/tag/{LLAMA_CPP_TAG} "
+            f"and place it at {LLAMA_SERVER_BIN}"
+        )
+
+    url = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_CPP_TAG}/{asset_name}"
+    archive_path = LLAMA_DIR / asset_name
+
+    logger.info(f"Downloading from {url}...")
+    urllib.request.urlretrieve(url, archive_path)
+
+    logger.info(f"Extracting {asset_name}...")
+    import tarfile
+
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=LLAMA_DIR)
+
+    extracted = list(LLAMA_DIR.glob("*/llama-server"))
+    if not extracted:
+        extracted = list(LLAMA_DIR.glob("llama-server"))
+    if not extracted:
+        raise RuntimeError(f"Could not find llama-server in extracted archive")
+
+    src_bin = extracted[0]
+    if src_bin != LLAMA_SERVER_BIN:
+        src_bin.rename(LLAMA_SERVER_BIN)
+
+    LLAMA_SERVER_BIN.chmod(0o755)
+    archive_path.unlink(missing_ok=True)
+
+    logger.info(f"llama-server ready at {LLAMA_SERVER_BIN}")
+    return LLAMA_SERVER_BIN
+
+
+def _download_gguf_model(repo_id: str) -> Path:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    repo_files = list_repo_files(repo_id=repo_id)
+    gguf_files = [f for f in repo_files if f.endswith(".gguf")]
+
+    if not gguf_files:
+        raise RuntimeError(f"No GGUF files found in {repo_id}")
+
+    preferred_order = ["q4_k_m", "q5_k_m", "q8_0", "q4_k_s", "q5_k_s", "q2_k", "q3_k_m"]
+    selected = None
+    for suffix in preferred_order:
+        for f in gguf_files:
+            if suffix in f.lower():
+                selected = f
+                break
+        if selected:
+            break
+
+    if not selected:
+        selected = gguf_files[0]
+
+    logger.info(f"Downloading GGUF file: {selected} from {repo_id}")
+    local_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=selected,
+        cache_dir=str(MODEL_CACHE_DIR),
+    )
+    logger.info(f"GGUF model cached at: {local_path}")
+    return Path(local_path)
+
+
+def _terminate_process(process: subprocess.Popen, name: str) -> None:
+    if process.poll() is not None:
+        return
+
+    logger.info(f"Stopping {name} process (pid={process.pid})...")
+    process.terminate()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"{name} did not stop in time. Killing process {process.pid}...")
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _wait_for_llama_server_ready(
+    models_url: str,
+    process: subprocess.Popen,
+    timeout_s: int,
+    stderr_log_path: Optional[str] = None,
+) -> None:
+    deadline = time.time() + timeout_s
+    last_output_size = 0
+    last_output_change_time = time.time()
+    freeze_threshold = 60
+
+    while time.time() < deadline:
+        if _is_http_ready(models_url):
+            return
+
+        if process.poll() is not None:
+            logs = ""
+            if stderr_log_path:
+                try:
+                    logs = Path(stderr_log_path).read_text()[-2000:]
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"llama-server exited before becoming ready "
+                f"(code={process.returncode}). Last logs:\n{logs}"
+            )
+
+        if stderr_log_path:
+            try:
+                current_size = Path(stderr_log_path).stat().st_size
+                if current_size != last_output_size:
+                    last_output_size = current_size
+                    last_output_change_time = time.time()
+                else:
+                    seconds_silent = time.time() - last_output_change_time
+                    if seconds_silent > freeze_threshold:
+                        recent_lines = _get_recent_log_lines(stderr_log_path, n=15)
+                        logger.warning(
+                            f"llama-server appears frozen (no output change for {seconds_silent:.0f}s). "
+                            f"Recent log:\n{recent_lines}"
+                        )
+            except FileNotFoundError:
+                pass
+
+        time.sleep(1)
+
+    raise TimeoutError(
+        f"Timed out waiting for llama-server readiness at {models_url} after {timeout_s}s"
     )
 
 
@@ -194,9 +340,7 @@ def start_or_get_vllm_client(vllm_config):
     configured_model = vllm_config.model
     resolved_model = _normalize_vllm_model(configured_model)
     if resolved_model != configured_model.strip():
-        logger.info(
-            f"Resolved vLLM model alias '{configured_model}' to '{resolved_model}'"
-        )
+        logger.info(f"Resolved model alias '{configured_model}' to '{resolved_model}'")
     vllm_config.model = resolved_model
 
     endpoint = vllm_config.endpoint.rstrip("/")
@@ -205,23 +349,114 @@ def start_or_get_vllm_client(vllm_config):
     api_key = vllm_config.api_key or "dummy"
 
     if _is_http_ready(models_url):
-        logger.info(f"Using existing vLLM server at {base_url}")
+        logger.info(f"Using existing server at {base_url}")
         return OpenAI(api_key=api_key, base_url=base_url)
 
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
     host = parsed.hostname or "localhost"
     port = parsed.port or 8000
+
+    backend = vllm_config.backend
+    if backend == "auto":
+        backend = "llama.cpp" if _is_gguf_model(resolved_model) else "vllm"
+
+    logger.info(
+        f"No server detected at {base_url}. Starting {backend} backend for "
+        f"{resolved_model} on port {port}..."
+    )
+
+    if backend == "llama.cpp":
+        return _start_llama_server(
+            resolved_model, host, port, vllm_config, base_url, models_url, api_key
+        )
+    elif backend == "vllm":
+        return _start_vllm_server(
+            resolved_model, host, port, vllm_config, base_url, models_url, api_key
+        )
+    else:
+        raise ValueError(
+            f"Unknown backend '{backend}'. Must be 'vllm', 'llama.cpp', or 'auto'."
+        )
+
+
+def _start_llama_server(
+    resolved_model, host, port, vllm_config, base_url, models_url, api_key
+):
+    from openai import OpenAI
+
+    llama_bin = _ensure_llama_server()
+
+    model_path_str = resolved_model
+    if _is_gguf_model(resolved_model) and not Path(resolved_model).exists():
+        repo_id = resolved_model
+        if "/" not in repo_id:
+            repo_id = f"unsloth/{repo_id}"
+        local_gguf = _download_gguf_model(repo_id)
+        model_path_str = str(local_gguf)
+        logger.info(f"Using local GGUF: {model_path_str}")
+
+    stderr_log = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=f"llama_stderr_{resolved_model.replace('/', '_')}_",
+        suffix=".log",
+        delete=False,
+    )
+    stderr_log_path = stderr_log.name
+    stderr_log.close()
+    logger.info(f"llama-server stderr log: {stderr_log_path}")
+
+    command = [
+        str(llama_bin),
+        "--model",
+        model_path_str,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--ctx-size",
+        "8192",
+        "--temp",
+        str(vllm_config.temperature),
+        "--n-gpu-layers",
+        "99",
+        "--jinja",
+    ]
+
+    logger.info(f"llama-server command: {' '.join(command)}")
+
+    with open(stderr_log_path, "a") as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+    atexit.register(_terminate_process, process, "llama-server")
+
+    startup_timeout = max(vllm_config.timeout, 500)
+    try:
+        _wait_for_llama_server_ready(
+            models_url, process, startup_timeout, stderr_log_path
+        )
+    except Exception:
+        _terminate_process(process, "llama-server")
+        raise
+
+    logger.info(f"llama-server is ready at {base_url}")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _start_vllm_server(
+    resolved_model, host, port, vllm_config, base_url, models_url, api_key
+):
+    from openai import OpenAI
+
     command = _build_vllm_command(
-        vllm_config.model,
+        resolved_model,
         host,
         port,
         vllm_config.gpu_memory_utilization,
     )
 
-    logger.info(
-        f"No vLLM server detected at {base_url}. Starting subprocess for "
-        f"{vllm_config.model} on {host}:{port}..."
-    )
     logger.info(f"vLLM command: {' '.join(command)}")
 
     stderr_log = tempfile.NamedTemporaryFile(
@@ -292,12 +527,16 @@ def main(config_file: str = "./config/config-container.toml"):
             device=config.peft.device,
         )
         genner = get_genner("qwen-peft", qwen_peft_config=qwen_peft_config)
-    elif config.model_name.startswith("vllm"):
+    elif config.model_name.startswith("vllm") or config.model_name.startswith("llama"):
         from src.genner.config import VllmConfig
 
         vllm_config = VllmConfig()
         if config.model_name.startswith("vllm:"):
             vllm_config.model = config.model_name.split(":", 1)[1].strip()
+            vllm_config.backend = "vllm"
+        elif config.model_name.startswith("llama:"):
+            vllm_config.model = config.model_name.split(":", 1)[1].strip()
+            vllm_config.backend = "llama.cpp"
         elif config.model_name != "vllm":
             vllm_config.model = config.model_name
         vllm_config.gpu_memory_utilization = config.gpu_memory_utilization
