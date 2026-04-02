@@ -6,7 +6,6 @@ import tempfile
 import time
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 from urllib.parse import urlparse
@@ -17,9 +16,10 @@ from openai import OpenAI
 
 from src.backend.utils import get_recent_log_lines, is_http_ready, terminate_process
 from src.genner import get_genner
-from src.genner.Base import Genner
 from src.genner.config import VllmConfig
 from src.typing.config import AppConfig
+
+from .session import BackendSession
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -29,15 +29,7 @@ LLAMA_SERVER_BIN = LLAMA_DIR / "llama-server"
 MODEL_CACHE_DIR = PROJECT_ROOT / ".model-cache"
 
 
-@dataclass
-class LlamaBackendSession:
-    client: OpenAI
-    genner: Genner
-    config: VllmConfig
-    base_url: str
-    models_url: str
-    stderr_log_path: Optional[str] = None
-    process: Optional[subprocess.Popen] = None
+LlamaBackendSession = BackendSession
 
 
 def _is_gguf_model(model: str) -> bool:
@@ -197,6 +189,19 @@ def _wait_for_llama_server_ready(
     )
 
 
+def _build_llama_smoke_test(client: OpenAI, config: VllmConfig):
+    def run_smoke_test() -> str:
+        test_response = client.chat.completions.create(
+            model=config.model,
+            messages=[{"role": "user", "content": "Who are you?"}],
+            max_tokens=50,
+            temperature=0.5,
+        )
+        return test_response.choices[0].message.content
+
+    return run_smoke_test
+
+
 def _build_llama_session(
     client: OpenAI,
     config: VllmConfig,
@@ -207,8 +212,9 @@ def _build_llama_session(
 ) -> LlamaBackendSession:
     genner = get_genner("vllm", vllm_config=config, oai_client=client)
     return LlamaBackendSession(
-        client=client,
         genner=genner,
+        smoke_test=_build_llama_smoke_test(client, config),
+        client=client,
         config=config,
         base_url=base_url,
         models_url=models_url,

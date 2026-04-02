@@ -6,6 +6,7 @@ import json
 import random
 import platform
 import tempfile
+from contextlib import ExitStack
 from datetime import datetime
 import time
 import urllib.request
@@ -31,6 +32,7 @@ from src.agent import (
     regenerate_list,
     regenerate_env_discovery_code,
 )
+from src.backend import resolve_backend_context
 from src.genner import get_genner
 from src.genner.Base import Genner
 from src.helper import (
@@ -56,438 +58,14 @@ from src.typing.training import (
 )
 
 
-RUN_ID = generate_readable_run_id()
-COMMIT_ID = get_formatted_repo_info()
-
-LLAMA_CPP_TAG = "b8606"
-LLAMA_DIR = project_root / ".llama"
-LLAMA_SERVER_BIN = LLAMA_DIR / "llama-server"
-
-MODEL_CACHE_DIR = project_root / ".model-cache"
-
-
-def _is_http_ready(url: str, timeout_sec: float = 2.0) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout_sec) as response:
-            return 200 <= response.status < 300
-    except Exception:
-        return False
-
-
-def _is_gguf_model(model: str) -> bool:
-    return "gguf" in model.lower() or model.lower().endswith(".gguf")
-
-
-def _normalize_vllm_model(model: str) -> str:
-    normalized_model = model.strip()
-    legacy_model_aliases = {
-        "qwen2.5-coder:7b-instruct": "Qwen/Qwen2.5-Coder-7B-Instruct",
-        "qwen2.5:7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
-    }
-    return legacy_model_aliases.get(normalized_model, normalized_model)
-
-
-def _build_vllm_command(
-    model: str, host: str, port: int, gpu_memory_utilization: float
-) -> List[str]:
-    vllm_bin = shutil.which("vllm")
-    gpu_memory_utilization_arg = str(gpu_memory_utilization)
-    extra_args: List[str] = []
-    if _is_gguf_model(model):
-        extra_args.extend(["--quantization", "gguf"])
-    if vllm_bin:
-        return [
-            vllm_bin,
-            "serve",
-            model,
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--gpu-memory-utilization",
-            gpu_memory_utilization_arg,
-            *extra_args,
-        ]
-    return [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
-        model,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--gpu-memory-utilization",
-        gpu_memory_utilization_arg,
-        *extra_args,
-    ]
-
-
-def _wait_for_vllm_ready(
-    models_url: str,
-    process: subprocess.Popen,
-    timeout_s: int,
-    command: List[str],
-    stderr_log_path: Optional[str] = None,
-) -> None:
-    deadline = time.time() + timeout_s
-    last_output_size = 0
-    last_output_change_time = time.time()
-    freeze_threshold = 60
-
-    while time.time() < deadline:
-        if _is_http_ready(models_url):
-            return
-
-        if process.poll() is not None:
-            raise RuntimeError(
-                "vLLM process exited before becoming ready "
-                f"(code={process.returncode}, command={' '.join(command)})"
-            )
-
-        if stderr_log_path:
-            try:
-                current_size = Path(stderr_log_path).stat().st_size
-                if current_size != last_output_size:
-                    last_output_size = current_size
-                    last_output_change_time = time.time()
-                else:
-                    seconds_silent = time.time() - last_output_change_time
-                    if seconds_silent > freeze_threshold:
-                        recent_lines = _get_recent_log_lines(stderr_log_path, n=15)
-                        logger.warning(
-                            f"vLLM appears frozen (no output change for {seconds_silent:.0f}s). "
-                            f"Recent log:\n{recent_lines}"
-                        )
-            except FileNotFoundError:
-                pass
-
-        time.sleep(1)
-
-    raise TimeoutError(
-        f"Timed out waiting for vLLM readiness at {models_url} after {timeout_s}s"
-    )
-
-
-def _ensure_llama_server() -> Path:
-    in_path = shutil.which("llama-server")
-    if in_path:
-        logger.info(f"llama-server found on PATH at {in_path}")
-        return Path(in_path)
-
-    if LLAMA_SERVER_BIN.exists():
-        logger.info(f"llama-server found at {LLAMA_SERVER_BIN}")
-        return LLAMA_SERVER_BIN
-
-    logger.info(f"Downloading llama-server {LLAMA_CPP_TAG}...")
-    LLAMA_DIR.mkdir(parents=True, exist_ok=True)
-
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-
-    if system == "linux" and machine in ("x86_64", "amd64"):
-        asset_name = f"llama-{LLAMA_CPP_TAG}-bin-ubuntu-x64.tar.gz"
-    else:
-        raise RuntimeError(
-            f"Unsupported platform: {system}/{machine}. "
-            f"Install llama-cpp via your package manager (e.g., nixpkgs#llama-cpp) "
-            f"or download a binary from "
-            f"https://github.com/ggml-org/llama.cpp/releases/tag/{LLAMA_CPP_TAG} "
-            f"and place it at {LLAMA_SERVER_BIN}"
-        )
-
-    url = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_CPP_TAG}/{asset_name}"
-    archive_path = LLAMA_DIR / asset_name
-
-    logger.info(f"Downloading from {url}...")
-    urllib.request.urlretrieve(url, archive_path)
-
-    logger.info(f"Extracting {asset_name}...")
-    import tarfile
-
-    with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(path=LLAMA_DIR)
-
-    extracted = list(LLAMA_DIR.glob("*/llama-server"))
-    if not extracted:
-        extracted = list(LLAMA_DIR.glob("llama-server"))
-    if not extracted:
-        raise RuntimeError(f"Could not find llama-server in extracted archive")
-
-    src_bin = extracted[0]
-    if src_bin != LLAMA_SERVER_BIN:
-        src_bin.rename(LLAMA_SERVER_BIN)
-
-    LLAMA_SERVER_BIN.chmod(0o755)
-    archive_path.unlink(missing_ok=True)
-
-    logger.info(f"llama-server ready at {LLAMA_SERVER_BIN}")
-    return LLAMA_SERVER_BIN
-
-
-def _download_gguf_model(repo_id: str) -> Path:
-    from huggingface_hub import hf_hub_download, list_repo_files
-
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    repo_files = list_repo_files(repo_id=repo_id)
-    gguf_files = [f for f in repo_files if f.endswith(".gguf")]
-
-    if not gguf_files:
-        raise RuntimeError(f"No GGUF files found in {repo_id}")
-
-    preferred_order = ["q4_k_m", "q5_k_m", "q8_0", "q4_k_s", "q5_k_s", "q2_k", "q3_k_m"]
-    selected = None
-    for suffix in preferred_order:
-        for f in gguf_files:
-            if suffix in f.lower():
-                selected = f
-                break
-        if selected:
-            break
-
-    if not selected:
-        selected = gguf_files[0]
-
-    logger.info(f"Downloading GGUF file: {selected} from {repo_id}")
-    local_path = hf_hub_download(
-        repo_id=repo_id,
-        filename=selected,
-        cache_dir=str(MODEL_CACHE_DIR),
-    )
-    logger.info(f"GGUF model cached at: {local_path}")
-    return Path(local_path)
-
-
-def _terminate_process(process: subprocess.Popen, name: str) -> None:
-    if process.poll() is not None:
+def _run_backend_smoke_test(backend_session) -> None:
+    smoke_test = getattr(backend_session, "smoke_test", None)
+    if smoke_test is None:
         return
 
-    logger.info(f"Stopping {name} process (pid={process.pid})...")
-    process.terminate()
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        logger.warning(f"{name} did not stop in time. Killing process {process.pid}...")
-        process.kill()
-        process.wait(timeout=5)
-
-
-def _wait_for_llama_server_ready(
-    models_url: str,
-    process: subprocess.Popen,
-    timeout_s: int,
-    stderr_log_path: Optional[str] = None,
-) -> None:
-    deadline = time.time() + timeout_s
-    last_output_size = 0
-    last_output_change_time = time.time()
-    freeze_threshold = 60
-
-    while time.time() < deadline:
-        if _is_http_ready(models_url):
-            return
-
-        if process.poll() is not None:
-            logs = ""
-            if stderr_log_path:
-                try:
-                    logs = Path(stderr_log_path).read_text()[-2000:]
-                except Exception:
-                    pass
-            raise RuntimeError(
-                f"llama-server exited before becoming ready "
-                f"(code={process.returncode}). Last logs:\n{logs}"
-            )
-
-        if stderr_log_path:
-            try:
-                current_size = Path(stderr_log_path).stat().st_size
-                if current_size != last_output_size:
-                    last_output_size = current_size
-                    last_output_change_time = time.time()
-                else:
-                    seconds_silent = time.time() - last_output_change_time
-                    if seconds_silent > freeze_threshold:
-                        recent_lines = _get_recent_log_lines(stderr_log_path, n=15)
-                        logger.warning(
-                            f"llama-server appears frozen (no output change for {seconds_silent:.0f}s). "
-                            f"Recent log:\n{recent_lines}"
-                        )
-            except FileNotFoundError:
-                pass
-
-        time.sleep(1)
-
-    raise TimeoutError(
-        f"Timed out waiting for llama-server readiness at {models_url} after {timeout_s}s"
-    )
-
-
-def _get_recent_log_lines(log_path: str, n: int = 15) -> str:
-    try:
-        with open(log_path, "r") as f:
-            lines = f.readlines()
-            return "".join(lines[-n:])
-    except Exception as e:
-        return f"(could not read log: {e})"
-
-
-def start_or_get_vllm_client(vllm_config):
-    from openai import OpenAI
-
-    configured_model = vllm_config.model
-    resolved_model = _normalize_vllm_model(configured_model)
-    if resolved_model != configured_model.strip():
-        logger.info(f"Resolved model alias '{configured_model}' to '{resolved_model}'")
-    vllm_config.model = resolved_model
-
-    endpoint = vllm_config.endpoint.rstrip("/")
-    base_url = endpoint if endpoint.endswith("/v1") else f"{endpoint}/v1"
-    models_url = f"{base_url}/models"
-    api_key = vllm_config.api_key or "dummy"
-
-    if _is_http_ready(models_url):
-        logger.info(f"Using existing server at {base_url}")
-        return OpenAI(api_key=api_key, base_url=base_url)
-
-    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 8000
-
-    backend = vllm_config.backend
-    if backend == "auto":
-        backend = "llama.cpp" if _is_gguf_model(resolved_model) else "vllm"
-
-    logger.info(
-        f"No server detected at {base_url}. Starting {backend} backend for "
-        f"{resolved_model} on port {port}..."
-    )
-
-    if backend == "llama.cpp":
-        return _start_llama_server(
-            resolved_model, host, port, vllm_config, base_url, models_url, api_key
-        )
-    elif backend == "vllm":
-        return _start_vllm_server(
-            resolved_model, host, port, vllm_config, base_url, models_url, api_key
-        )
-    else:
-        raise ValueError(
-            f"Unknown backend '{backend}'. Must be 'vllm', 'llama.cpp', or 'auto'."
-        )
-
-
-def _start_llama_server(
-    resolved_model, host, port, vllm_config, base_url, models_url, api_key
-):
-    from openai import OpenAI
-
-    llama_bin = _ensure_llama_server()
-
-    model_path_str = resolved_model
-    if _is_gguf_model(resolved_model) and not Path(resolved_model).exists():
-        repo_id = resolved_model
-        if "/" not in repo_id:
-            repo_id = f"unsloth/{repo_id}"
-        local_gguf = _download_gguf_model(repo_id)
-        model_path_str = str(local_gguf)
-        logger.info(f"Using local GGUF: {model_path_str}")
-
-    stderr_log = tempfile.NamedTemporaryFile(
-        mode="w",
-        prefix=f"llama_stderr_{resolved_model.replace('/', '_')}_",
-        suffix=".log",
-        delete=False,
-    )
-    stderr_log_path = stderr_log.name
-    stderr_log.close()
-    logger.info(f"llama-server stderr log: {stderr_log_path}")
-
-    command = [
-        str(llama_bin),
-        "--model",
-        model_path_str,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--ctx-size",
-        "8192",
-        "--temp",
-        str(vllm_config.temperature),
-        "--n-gpu-layers",
-        "99",
-        "--jinja",
-    ]
-
-    logger.info(f"llama-server command: {' '.join(command)}")
-
-    with open(stderr_log_path, "a") as stderr_file:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_file,
-        )
-    atexit.register(_terminate_process, process, "llama-server")
-
-    startup_timeout = max(vllm_config.timeout, 500)
-    try:
-        _wait_for_llama_server_ready(
-            models_url, process, startup_timeout, stderr_log_path
-        )
-    except Exception:
-        _terminate_process(process, "llama-server")
-        raise
-
-    logger.info(f"llama-server is ready at {base_url}")
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def _start_vllm_server(
-    resolved_model, host, port, vllm_config, base_url, models_url, api_key
-):
-    from openai import OpenAI
-
-    command = _build_vllm_command(
-        resolved_model,
-        host,
-        port,
-        vllm_config.gpu_memory_utilization,
-    )
-
-    logger.info(f"vLLM command: {' '.join(command)}")
-
-    stderr_log = tempfile.NamedTemporaryFile(
-        mode="w",
-        prefix=f"vllm_stderr_{resolved_model.replace('/', '_')}_",
-        suffix=".log",
-        delete=False,
-    )
-    stderr_log_path = stderr_log.name
-    stderr_log.close()
-    logger.info(f"vLLM stderr log: {stderr_log_path}")
-
-    with open(stderr_log_path, "a") as stderr_file:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_file,
-        )
-    atexit.register(_terminate_process, process, "vLLM")
-
-    startup_timeout = max(vllm_config.timeout, 500)
-    try:
-        _wait_for_vllm_ready(
-            models_url, process, startup_timeout, command, stderr_log_path
-        )
-    except Exception:
-        _terminate_process(process, "vLLM")
-        raise
-
-    logger.info(f"vLLM server is ready at {base_url}")
-    return OpenAI(api_key=api_key, base_url=base_url)
+    logger.info("Running quick inference test...")
+    test_text = smoke_test()
+    logger.info(f"Inference test response: {test_text}")
 
 
 def main(config_file: str = "./config/config-container.toml"):
@@ -513,79 +91,39 @@ def main(config_file: str = "./config/config-container.toml"):
     }
 
     docker_client = docker.from_env()
+    backend_stack = ExitStack()
+    atexit.register(backend_stack.close)
 
     logger.info(f"Model name: {config.model_name}")
+    backend_context = resolve_backend_context(config)
+    if backend_context is None:
+        raise RuntimeError(f"No backend context registered for {config.model_name}")
 
     # Create genner based on model configuration
-    if config.model_name == "qwen-peft" and config.peft is not None:
+    if config.model_name == "qwen-peft":
         # Use PEFT-based model
-        from src.genner.config import QwenPeftConfig
-
-        qwen_peft_config = QwenPeftConfig(
-            base_model_path=config.peft.base_model_path,
-            checkpoint_path=config.peft.checkpoint_path,
-            device=config.peft.device,
-        )
-        genner = get_genner("qwen-peft", qwen_peft_config=qwen_peft_config)
-    elif config.model_name.startswith("vllm") or config.model_name.startswith("llama"):
-        from src.genner.config import VllmConfig
-
-        vllm_config = VllmConfig()
-        if config.model_name.startswith("vllm:"):
-            vllm_config.model = config.model_name.split(":", 1)[1].strip()
-            vllm_config.backend = "vllm"
-        elif config.model_name.startswith("llama:"):
-            vllm_config.model = config.model_name.split(":", 1)[1].strip()
-            vllm_config.backend = "llama.cpp"
-        elif config.model_name != "vllm":
-            vllm_config.model = config.model_name
-        vllm_config.gpu_memory_utilization = config.gpu_memory_utilization
-        vllm_config.temperature = 0.5
-        oai_client = start_or_get_vllm_client(vllm_config)
-
-        logger.info("Running quick inference test...")
-        test_response = oai_client.chat.completions.create(
-            model=vllm_config.model,
-            messages=[{"role": "user", "content": "Who are you?"}],
-            max_tokens=50,
-            temperature=0.5,
-        )
-        test_text = test_response.choices[0].message.content
-        logger.info(f"Inference test response: {test_text}")
-
-        genner = get_genner("vllm", vllm_config=vllm_config, oai_client=oai_client)
+        backend_session = backend_stack.enter_context(backend_context)
+        _run_backend_smoke_test(backend_session)
+        genner = backend_session.genner
+    elif config.model_name.startswith("llama:"):
+        backend_session = backend_stack.enter_context(backend_context)
+        _run_backend_smoke_test(backend_session)
+        genner = backend_session.genner
+    elif config.model_name.startswith("vllm"):
+        backend_session = backend_stack.enter_context(backend_context)
+        _run_backend_smoke_test(backend_session)
+        genner = backend_session.genner
     elif config.model_name == "claude":
         # Claude API support
-        import anthropic
-        import os
-        from src.genner import ClaudeConfig
-
-        # Get API key from environment variable
-        claude_api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not claude_api_key:
-            logger.error(
-                "ANTHROPIC_API_KEY environment variable is required for Claude backend"
-            )
-            return
-
-        claude_client = anthropic.Anthropic(api_key=claude_api_key)
-        # Use latest available Claude model from API
-        claude_config = ClaudeConfig(
-            model="claude-sonnet-4-6",  # Latest Sonnet 4.6 model
-            max_tokens=2000,
-            temperature=0.3,
-        )
-        genner = get_genner(
-            "claude", claude_client=claude_client, claude_config=claude_config
-        )
+        backend_session = backend_stack.enter_context(backend_context)
+        _run_backend_smoke_test(backend_session)
+        genner = backend_session.genner
 
     else:
         # Use regular Ollama-based model
-        from src.genner.config import QwenConfig
-
-        qwen_config = QwenConfig()
-        qwen_config.model = config.model_name
-        genner = get_genner("qwen", qwen_config=qwen_config)
+        backend_session = backend_stack.enter_context(backend_context)
+        _run_backend_smoke_test(backend_session)
+        genner = backend_session.genner
 
     # Start containers dynamically if configured
     if config.dynamic_container:
