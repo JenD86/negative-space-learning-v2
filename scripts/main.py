@@ -44,8 +44,10 @@ from src.helper import (
 from src.observability import MetricsCollector, MetricsGenner, PhaseMetric
 from src.tool.code import validate_code_offline
 from src.tool.docker import (
+    calculate_deduplicated_space_freed,
     get_container_free_disk_space_kb_v1,
     get_container_free_disk_space_kb_v2,
+    group_containers_by_filesystem,
     run_code_in_con,
     wait_and_get_container,
     write_code_in_con,
@@ -97,6 +99,7 @@ def _record_phase_metric(
         )
     )
     return collector.flush()
+
 
 def _run_backend_smoke_test(backend_session) -> None:
     smoke_test = getattr(backend_session, "smoke_test", None)
@@ -791,6 +794,12 @@ def strategy_code_flow(
     error_sources: List[str] = []
     error_contexts: List[str] = []
     latest_generation: Optional[str] = None
+    filesystem_groups = group_containers_by_filesystem(docker_client, containers)
+
+    logger.info(
+        f"Detected {len(filesystem_groups)} unique backing filesystems "
+        f"across {len(containers)} containers for v1 strategy execution"
+    )
 
     while strat_code is None:
         if current_attempt > config.strategy_code.max_retries:
@@ -902,7 +911,7 @@ def strategy_code_flow(
         ):
             case Ok(execution_output):
                 # Check if there's any space freed in V1 or V2
-                containers_space_freed_kb = 0
+                v2_space_measurements: Dict[str, Tuple[float, float]] = {}
                 for container in containers:
                     assert container.id is not None
 
@@ -955,10 +964,9 @@ def strategy_code_flow(
                     logger.info(f"  V1 change: {space_freed_v1} KB")
                     logger.info(f"  V2 change: {space_freed_v2} KB")
 
-                    containers_space_freed_kb += (
-                        (space_freed_v1 + space_freed_v2) / 2
-                        if space_freed_v1 is not None
-                        else space_freed_v2
+                    v2_space_measurements[container.id] = (
+                        old_free_space_v2_kb,
+                        new_free_space_v2_kb,
                     )
 
                     env_info_dict[container.id] = (
@@ -971,6 +979,15 @@ def strategy_code_flow(
                         new_free_space_v1_kb,
                         new_free_space_v2_kb,
                     )
+
+                containers_space_freed_kb = calculate_deduplicated_space_freed(
+                    v2_space_measurements,
+                    filesystem_groups,
+                )
+                logger.info(
+                    f"Deduplicated v1 space change across filesystems: "
+                    f"{containers_space_freed_kb} KB"
+                )
 
                 strat_code = code
                 strat_code_hash = string_hash(code)
@@ -1025,7 +1042,6 @@ def strategy_code_flow(
                 error_contexts.append(error_message)
                 error_sources.append("code_run")
 
-
     logger.info(f"Strategy code completed on strat \n{strategy}.")
     logger.info(f"Strategy code train data: {strat_code_train_data}")
     logger.info(f"Strategy code: {strat_code}")
@@ -1051,15 +1067,29 @@ def run_episode_v2(
     from src.mode_controller import ModeController
 
     mode_controller = ModeController(genner, config)
+    mode_controller.initialize_docker(
+        docker_client=docker_client,
+        container=containers[config.main_container_idx],
+        host_cache_folder=Path(config.code_host_cache_path) / "episode_v2_mode",
+    )
 
     # Start episode
     episode_id = f"ep_{RUN_ID}_{int(time.time())}"
     mode_controller.start_episode(episode_id)
 
     # Measure initial disk space (preserve existing measurement logic)
-    initial_free_space = {}
-    for i, container in enumerate(containers):
-        initial_free_space[i] = get_container_free_disk_space_kb_v2(container)
+    filesystem_groups = group_containers_by_filesystem(docker_client, containers)
+    logger.info(
+        f"Detected {len(filesystem_groups)} unique backing filesystems "
+        f"across {len(containers)} containers for v2 episode execution"
+    )
+
+    initial_free_space: Dict[str, float] = {}
+    for container in containers:
+        assert container.id is not None
+        initial_free_space[container.id] = get_container_free_disk_space_kb_v2(
+            container
+        )
 
     # Collect all prompt/response pairs for training data
     all_prompt_responses = []
@@ -1163,14 +1193,23 @@ def run_episode_v2(
             break
 
     # Measure final disk space (preserve existing measurement logic)
-    final_free_space = {}
-    total_space_freed = 0.0
+    final_free_space: Dict[str, float] = {}
+    space_measurements: Dict[str, Tuple[float, float]] = {}
 
     for i, container in enumerate(containers):
-        final_free_space[i] = get_container_free_disk_space_kb_v2(container)
-        space_freed = final_free_space[i] - initial_free_space[i]
-        total_space_freed += space_freed
+        assert container.id is not None
+        final_free_space[container.id] = get_container_free_disk_space_kb_v2(container)
+        space_freed = final_free_space[container.id] - initial_free_space[container.id]
+        space_measurements[container.id] = (
+            initial_free_space[container.id],
+            final_free_space[container.id],
+        )
         logger.info(f"Container {i}: {space_freed:.2f} KB freed")
+
+    total_space_freed = calculate_deduplicated_space_freed(
+        space_measurements,
+        filesystem_groups,
+    )
 
     logger.info(f"Total space freed: {total_space_freed:.2f} KB")
     logger.info(f"Episode completed - Success: {total_space_freed > 0.0}")
