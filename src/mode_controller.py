@@ -7,8 +7,10 @@ import subprocess
 import tempfile
 import os
 import re
+import time
 
 from src.action_system import ActionBudget, PromptResponsePair
+from src.observability.types import PhaseMetric
 from src.scratchpad import CrossEpisodeScratchpad
 from src.genner.Base import Genner
 from src.typing.config import AppConfig
@@ -30,6 +32,7 @@ class OrchestratorDecision:
     instruction: str
     reasoning: str
     raw_response: str
+    duration_ms: float = 0.0
 
 
 @dataclass
@@ -39,6 +42,7 @@ class ModeResult:
     success: bool
     content: str  # Main response content
     structured_data: Dict[str, Any]  # Parsed data (findings, space_freed, etc.)
+    duration_ms: float = 0.0
     error_message: Optional[str] = None
     code_executed: Optional[str] = None  # For investigator/explorer modes
     prompt_response_pair: Optional[PromptResponsePair] = None
@@ -52,7 +56,13 @@ class EpisodeState:
     mode_history: List[Dict[str, Any]]
     total_space_freed: float = 0.0
     
-    def add_mode_execution(self, mode: Mode, instruction: str, result: ModeResult):
+    def add_mode_execution(
+        self,
+        mode: Mode,
+        instruction: str,
+        result: ModeResult,
+        orchestrator_duration_ms: float = 0.0,
+    ):
         """Record a mode execution in history."""
         self.mode_history.append({
             "step": self.current_step,
@@ -60,7 +70,9 @@ class EpisodeState:
             "instruction": instruction,
             "success": result.success,
             "content": result.content[:200] + "..." if len(result.content) > 200 else result.content,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "duration_ms": result.duration_ms,
+            "orchestrator_duration_ms": orchestrator_duration_ms,
         })
         self.current_step += 1
 
@@ -133,6 +145,7 @@ class ModeController:
     def __init__(self, genner: Genner, config: AppConfig):
         self.genner = genner
         self.config = config
+        self.metrics_collector = getattr(genner, "collector", None)
         
         # Initialize episode components
         from pathlib import Path
@@ -152,6 +165,35 @@ class ModeController:
         # Episode state tracking
         self.episode_state = None
         self.current_mode = Mode.ORCHESTRATOR
+
+    def _message(self, role: str, content: str, phase: str) -> Message:
+        meta: Dict[str, Any] = {"phase": phase}
+        if self.episode_state is not None:
+            meta["episode_id"] = self.episode_state.episode_id
+        return {"role": role, "content": content, "meta": meta}
+
+    def _record_phase_metric(
+        self,
+        phase_name: str,
+        duration_ms: float,
+        success: bool,
+        error_message: Optional[str] = None,
+    ) -> None:
+        if self.metrics_collector is None:
+            return
+        episode_id = None
+        if self.episode_state is not None:
+            episode_id = self.episode_state.episode_id
+        self.metrics_collector.record_phase_safe(
+            PhaseMetric(
+                phase_name=phase_name,
+                run_id=self.metrics_collector.run_id,
+                episode_id=episode_id,
+                duration_ms=duration_ms,
+                success=success,
+                error_message=error_message,
+            )
+        )
         
     def start_episode(self, episode_id: str):
         """Initialize new episode."""
@@ -188,13 +230,14 @@ class ModeController:
         )
         
         messages = [
-            {"role": "system", "content": prompt_data["system_prompt"]},
-            {"role": "user", "content": prompt_data["user_prompt"]}
+            self._message("system", prompt_data["system_prompt"], "orchestrator"),
+            self._message("user", prompt_data["user_prompt"], "orchestrator"),
         ]
-        
-        # Execute with Claude
+
+        started_at = time.perf_counter()
         match self.genner.plist_completion(messages):
-            case Ok(raw_response):
+            case Ok(inference_result):
+                raw_response = inference_result.content
                 # Print orchestrator conversation
                 print(f"\n{'='*60}")
                 print(f"🎯 ORCHESTRATOR MODE - Strategic Decision:")
@@ -206,13 +249,21 @@ class ModeController:
                 
                 # Parse orchestrator response
                 decision = parse_orchestrator_response(raw_response)
+                decision.duration_ms = (time.perf_counter() - started_at) * 1000
                 
                 # Consume budget for orchestrator decision
                 self.budget.consume(1)
+                self._record_phase_metric(
+                    "orchestrator",
+                    decision.duration_ms,
+                    True,
+                )
                 
                 return decision
                 
             case Err(error):
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                self._record_phase_metric("orchestrator", duration_ms, False, str(error))
                 logger.error(f"Orchestrator mode failed: {error}")
                 raise RuntimeError(f"Orchestrator execution failed: {error}")
     
@@ -222,16 +273,25 @@ class ModeController:
             raise ValueError("Use execute_orchestrator_mode() for orchestrator mode")
             
         logger.info(f"Executing {mode.value} mode: {instruction[:100]}...")
-        
-        # Import mode-specific functions
+
+        started_at = time.perf_counter()
         if mode == Mode.INVESTIGATOR:
-            return self._execute_investigator_mode(instruction)
+            result = self._execute_investigator_mode(instruction)
         elif mode == Mode.EXPLORER:
-            return self._execute_explorer_mode(instruction)
+            result = self._execute_explorer_mode(instruction)
         elif mode == Mode.RECORDER:
-            return self._execute_recorder_mode(instruction)
+            result = self._execute_recorder_mode(instruction)
         else:
             raise ValueError(f"Unknown mode: {mode}")
+
+        result.duration_ms = (time.perf_counter() - started_at) * 1000
+        self._record_phase_metric(
+            mode.value,
+            result.duration_ms,
+            result.success,
+            result.error_message,
+        )
+        return result
     
     def _execute_investigator_mode(self, instruction: str) -> ModeResult:
         """Execute investigator mode - environment reconnaissance."""
@@ -244,12 +304,13 @@ class ModeController:
         )
         
         messages = [
-            {"role": "system", "content": prompt_data["system_prompt"]},
-            {"role": "user", "content": prompt_data["user_prompt"]}
+            self._message("system", prompt_data["system_prompt"], "investigator"),
+            self._message("user", prompt_data["user_prompt"], "investigator"),
         ]
         
         match self.genner.plist_completion(messages):
-            case Ok(raw_response):
+            case Ok(inference_result):
+                raw_response = inference_result.content
                 # Print investigator conversation
                 print(f"\n{'='*60}")
                 print(f"🔍 INVESTIGATOR MODE - Environment Analysis:")
@@ -335,12 +396,13 @@ class ModeController:
         )
         
         messages = [
-            {"role": "system", "content": prompt_data["system_prompt"]},
-            {"role": "user", "content": prompt_data["user_prompt"]}
+            self._message("system", prompt_data["system_prompt"], "explorer"),
+            self._message("user", prompt_data["user_prompt"], "explorer"),
         ]
         
         match self.genner.plist_completion(messages):
-            case Ok(raw_response):
+            case Ok(inference_result):
+                raw_response = inference_result.content
                 # Print explorer conversation
                 print(f"\n{'='*60}")
                 print(f"💻 EXPLORER MODE - Cleanup Execution:")
@@ -453,12 +515,13 @@ class ModeController:
         )
         
         messages = [
-            {"role": "system", "content": prompt_data["system_prompt"]},
-            {"role": "user", "content": prompt_data["user_prompt"]}
+            self._message("system", prompt_data["system_prompt"], "recorder"),
+            self._message("user", prompt_data["user_prompt"], "recorder"),
         ]
         
         match self.genner.plist_completion(messages):
-            case Ok(raw_response):
+            case Ok(inference_result):
+                raw_response = inference_result.content
                 # Print recorder conversation
                 print(f"\n{'='*60}")
                 print(f"📝 RECORDER MODE - Memory Management:")

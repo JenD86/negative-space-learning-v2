@@ -6,6 +6,7 @@ from typing import Any, List, Tuple, cast, Optional
 import anthropic
 from result import Result, Ok, Err, UnwrapError
 
+from src.observability.types import InferenceResult, UsageInfo
 from src.typing.message import Message
 from .Base import Genner
 from dataclasses import dataclass, field
@@ -40,7 +41,7 @@ class ClaudeGenner(Genner):
         self.client = client
         self.config = config
 
-    def plist_completion(self, messages: List[Message]) -> Result[str, str]:
+    def plist_completion(self, messages: List[Message]) -> Result[InferenceResult, str]:
         try:
             # Convert messages format for Claude
             claude_messages = []
@@ -64,7 +65,12 @@ class ClaudeGenner(Genner):
                 messages=claude_messages
             )
             
-            return Ok(response.content[0].text)
+            return Ok(
+                InferenceResult(
+                    content=response.content[0].text,
+                    usage=self.get_usage_info(response),
+                )
+            )
             
         except Exception as e:
             import traceback
@@ -80,7 +86,7 @@ class ClaudeGenner(Genner):
     ) -> Result[Tuple[str, str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             extracted_code = self.extract_code(raw_response).unwrap()
             return Ok((extracted_code, raw_response))
         except UnwrapError as e:
@@ -104,7 +110,7 @@ class ClaudeGenner(Genner):
     ) -> Result[Tuple[List[str], str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             extracted_list = self.extract_list(raw_response).unwrap()
             return Ok((extracted_list, raw_response))
         except UnwrapError as e:
@@ -234,3 +240,20 @@ class ClaudeGenner(Genner):
                 f"`pass_2_exception`: \n{pass_2_exception}\n"
                 f"`response`: \n{response}\n"
             )
+
+    @staticmethod
+    def get_usage_info(response: object) -> UsageInfo:
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "input_tokens", None)
+        completion_tokens = getattr(usage, "output_tokens", None)
+        total_tokens = None
+        if prompt_tokens is not None or completion_tokens is not None:
+            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+        return UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            model=getattr(response, "model", None),
+            stop_reason=getattr(response, "stop_reason", None),
+        )

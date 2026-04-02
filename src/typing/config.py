@@ -1,5 +1,5 @@
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AppConfig(BaseModel):
@@ -39,6 +39,15 @@ class AppConfig(BaseModel):
         max_retries: int
 
     strategy_code: StrategyCodeConfig
+
+    class ObservabilityConfig(BaseModel):
+        enabled: bool = True
+        record_inference: bool = True
+        record_phases: bool = True
+        record_resources: bool = True
+        metrics_output_path: Optional[str] = None
+
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
     class EpisodeConfig(BaseModel):
         action_budget: int = 12
