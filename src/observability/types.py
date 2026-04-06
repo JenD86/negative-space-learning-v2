@@ -53,3 +53,5 @@ class PhaseMetric:
 class ResourceSnapshot:
     gpu_memory_mb: Optional[float] = None
     host_memory_mb: Optional[float] = None
+    gpu_utilization_pct: Optional[float] = None
+    cpu_utilization_pct: Optional[float] = None

@@ -1,5 +1,18 @@
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    return int(value)
 
 
 @dataclass
@@ -22,6 +35,14 @@ class EpisodeTrajectory:
     space_measurements: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     filesystem_groups: List[Dict[str, Any]] = field(default_factory=list)
     measurement_errors: List[str] = field(default_factory=list)
+    container_overhead_seconds: Optional[float] = None
+    episode_execution_seconds: Optional[float] = None
+    total_inference_ms: Optional[float] = None
+    inference_call_count: Optional[int] = None
+    average_output_tokens_per_second: Optional[float] = None
+    inference_duty_cycle: Optional[float] = None
+    gpu_utilization_pct: Optional[float] = None
+    cpu_utilization_pct: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -50,6 +71,20 @@ class EpisodeTrajectory:
             },
             filesystem_groups=list(payload.get("filesystem_groups", [])),
             measurement_errors=list(payload.get("measurement_errors", [])),
+            container_overhead_seconds=_optional_float(
+                payload.get("container_overhead_seconds")
+            ),
+            episode_execution_seconds=_optional_float(
+                payload.get("episode_execution_seconds")
+            ),
+            total_inference_ms=_optional_float(payload.get("total_inference_ms")),
+            inference_call_count=_optional_int(payload.get("inference_call_count")),
+            average_output_tokens_per_second=_optional_float(
+                payload.get("average_output_tokens_per_second")
+            ),
+            inference_duty_cycle=_optional_float(payload.get("inference_duty_cycle")),
+            gpu_utilization_pct=_optional_float(payload.get("gpu_utilization_pct")),
+            cpu_utilization_pct=_optional_float(payload.get("cpu_utilization_pct")),
         )
 
 
@@ -110,4 +145,72 @@ class GenerationData:
         }
         if run_id is not None:
             payload["run_id"] = run_id
+
+        if self.started_at and self.completed_at:
+            started_at = datetime.fromisoformat(self.started_at)
+            completed_at = datetime.fromisoformat(self.completed_at)
+            elapsed_seconds = (completed_at - started_at).total_seconds()
+            if elapsed_seconds > 0:
+                elapsed_hours = elapsed_seconds / 3600
+                payload["episodes_per_hour"] = self.total_episodes_run / elapsed_hours
+                payload["successful_rows_per_hour"] = (
+                    self.total_rows_collected / elapsed_hours
+                )
+
+        episodes_with_output_rate = [
+            episode.average_output_tokens_per_second
+            for episode in self.all_episodes
+            if episode.average_output_tokens_per_second is not None
+        ]
+        if episodes_with_output_rate:
+            payload["average_output_tokens_per_second"] = sum(
+                episodes_with_output_rate
+            ) / len(episodes_with_output_rate)
+
+        episodes_with_duty_cycle = [
+            episode.inference_duty_cycle
+            for episode in self.all_episodes
+            if episode.inference_duty_cycle is not None
+        ]
+        if episodes_with_duty_cycle:
+            payload["average_inference_duty_cycle"] = sum(
+                episodes_with_duty_cycle
+            ) / len(episodes_with_duty_cycle)
+
+        episodes_with_gpu_utilization = [
+            episode.gpu_utilization_pct
+            for episode in self.all_episodes
+            if episode.gpu_utilization_pct is not None
+        ]
+        if episodes_with_gpu_utilization:
+            payload["average_gpu_utilization_pct"] = sum(
+                episodes_with_gpu_utilization
+            ) / len(episodes_with_gpu_utilization)
+
+        episodes_with_cpu_utilization = [
+            episode.cpu_utilization_pct
+            for episode in self.all_episodes
+            if episode.cpu_utilization_pct is not None
+        ]
+        if episodes_with_cpu_utilization:
+            payload["average_cpu_utilization_pct"] = sum(
+                episodes_with_cpu_utilization
+            ) / len(episodes_with_cpu_utilization)
+
+        container_overheads = [
+            episode.container_overhead_seconds
+            for episode in self.all_episodes
+            if episode.container_overhead_seconds is not None
+        ]
+        if container_overheads:
+            payload["total_container_overhead_seconds"] = sum(container_overheads)
+
+        inference_seconds = [
+            episode.total_inference_ms / 1000
+            for episode in self.all_episodes
+            if episode.total_inference_ms is not None
+        ]
+        if inference_seconds:
+            payload["total_inference_seconds"] = sum(inference_seconds)
+
         return payload

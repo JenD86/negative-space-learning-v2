@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.container import ContainerManager
 from src.helper import generate_readable_run_id, unflatten_toml_dict
+from src.scratchpad import CrossEpisodeScratchpad
 from src.typing.config import AppConfig
 from src.typing.training import (
     append_episode_jsonl,
@@ -34,6 +35,9 @@ class _NullProgressBar:
 
     def update(self, increment: int = 1) -> None:
         self.n += increment
+
+    def set_postfix(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
 
     def close(self) -> None:
         return None
@@ -61,6 +65,48 @@ def select_variation_index(
     raise ValueError(f"Unsupported variation strategy: {strategy}")
 
 
+def _compute_episode_inference_metrics(
+    before_summary: dict[str, object],
+    after_summary: dict[str, object],
+) -> tuple[float, int, Optional[float]]:
+    def _as_float(value: object) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.0
+
+    def _as_int(value: object) -> int:
+        if isinstance(value, (int, float)):
+            return int(value)
+        return 0
+
+    total_inference_ms = max(
+        0.0,
+        _as_float(after_summary.get("total_latency_ms", 0.0))
+        - _as_float(before_summary.get("total_latency_ms", 0.0)),
+    )
+    inference_call_count = max(
+        0,
+        _as_int(after_summary.get("inference_calls", 0))
+        - _as_int(before_summary.get("inference_calls", 0)),
+    )
+    total_output_tokens = max(
+        0,
+        _as_int(after_summary.get("total_output_tokens", 0))
+        - _as_int(before_summary.get("total_output_tokens", 0)),
+    )
+    if total_inference_ms <= 0:
+        return total_inference_ms, inference_call_count, None
+    return (
+        total_inference_ms,
+        inference_call_count,
+        total_output_tokens / (total_inference_ms / 1000),
+    )
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def run_single_episode(
     genner,
     docker_client,
@@ -72,11 +118,15 @@ def run_single_episode(
     run_id,
     metrics_collector=None,
 ) -> EpisodeTrajectory:
-    del metrics_collector
     started_at = datetime.now().isoformat()
     generation_config = config.generation or AppConfig.GenerationConfig()
     episode_config = config.episode or AppConfig.EpisodeConfig()
+    output_dir = Path(generation_config.generation_output_dir)
     episode_id = f"ep_gen{generation_id}_{episode_index:04d}_{int(time.time())}"
+    before_summary = (
+        metrics_collector.summary() if metrics_collector is not None else {}
+    )
+    container_started_at = time.perf_counter()
     population_results = container_manager.populate(variation_index)
     primary_population = population_results[0] if population_results else None
     variation_name = getattr(
@@ -89,6 +139,7 @@ def run_single_episode(
     )
 
     if not verification.get("success", False):
+        container_overhead_seconds = time.perf_counter() - container_started_at
         completed_at = datetime.now().isoformat()
         return EpisodeTrajectory(
             episode_id=episode_id,
@@ -103,11 +154,13 @@ def run_single_episode(
             container_variation=variation_name,
             started_at=started_at,
             completed_at=completed_at,
-            duration_seconds=(
-                datetime.fromisoformat(completed_at)
-                - datetime.fromisoformat(started_at)
-            ).total_seconds(),
+            duration_seconds=container_overhead_seconds,
             error_message="container population verification failed",
+            container_overhead_seconds=container_overhead_seconds,
+            episode_execution_seconds=0.0,
+            total_inference_ms=0.0,
+            inference_call_count=0,
+            inference_duty_cycle=0.0,
         )
 
     scratchpad_storage_path = episode_config.scratchpad_storage_path
@@ -118,7 +171,9 @@ def run_single_episode(
         scratchpad_path = Path(scratchpad_storage_path)
         if scratchpad_path.exists():
             scratchpad_path.unlink()
+    container_overhead_seconds = time.perf_counter() - container_started_at
 
+    execution_started_at = time.perf_counter()
     try:
         episode_result = run_episode_v2(
             genner,
@@ -130,13 +185,31 @@ def run_single_episode(
             episode_id=episode_id,
         )
     except Exception as exc:
+        episode_execution_seconds = time.perf_counter() - execution_started_at
+        after_summary = (
+            metrics_collector.summary() if metrics_collector is not None else {}
+        )
+        total_inference_ms, inference_call_count, average_output_tokens_per_second = (
+            _compute_episode_inference_metrics(before_summary, after_summary)
+        )
+        scratchpad_snapshot_path = _snapshot_episode_scratchpad(
+            scratchpad_storage_path,
+            output_dir,
+            generation_id,
+            episode_index,
+            episode_id,
+        )
         completed_at = datetime.now().isoformat()
+        duration_seconds = container_overhead_seconds + episode_execution_seconds
+        trajectory: dict[str, Any] = {}
+        if scratchpad_snapshot_path is not None:
+            trajectory["scratchpad_snapshot_path"] = str(scratchpad_snapshot_path)
         return EpisodeTrajectory(
             episode_id=episode_id,
             generation_id=generation_id,
             episode_index=episode_index,
             prompt_responses=[],
-            trajectory={},
+            trajectory=trajectory,
             space_freed_kb=0.0,
             episode_runtime_success=False,
             success=False,
@@ -144,14 +217,34 @@ def run_single_episode(
             container_variation=variation_name,
             started_at=started_at,
             completed_at=completed_at,
-            duration_seconds=(
-                datetime.fromisoformat(completed_at)
-                - datetime.fromisoformat(started_at)
-            ).total_seconds(),
+            duration_seconds=duration_seconds,
             error_message=str(exc),
+            container_overhead_seconds=container_overhead_seconds,
+            episode_execution_seconds=episode_execution_seconds,
+            total_inference_ms=total_inference_ms,
+            inference_call_count=inference_call_count,
+            average_output_tokens_per_second=average_output_tokens_per_second,
+            inference_duty_cycle=(
+                (total_inference_ms / 1000) / duration_seconds
+                if duration_seconds > 0 and total_inference_ms > 0
+                else 0.0
+            ),
         )
 
+    episode_execution_seconds = time.perf_counter() - execution_started_at
+    after_summary = metrics_collector.summary() if metrics_collector is not None else {}
+    total_inference_ms, inference_call_count, average_output_tokens_per_second = (
+        _compute_episode_inference_metrics(before_summary, after_summary)
+    )
     completed_at = datetime.now().isoformat()
+    final_episode_id = str(episode_result.get("episode_id", episode_id))
+    scratchpad_snapshot_path = _snapshot_episode_scratchpad(
+        scratchpad_storage_path,
+        output_dir,
+        generation_id,
+        episode_index,
+        final_episode_id,
+    )
     space_freed_kb = float(episode_result.get("space_freed_kb", 0.0))
     episode_runtime_success = bool(
         episode_result.get(
@@ -159,12 +252,16 @@ def run_single_episode(
         )
     )
     success = space_freed_kb > generation_config.success_threshold_kb
+    duration_seconds = container_overhead_seconds + episode_execution_seconds
+    trajectory = dict(episode_result.get("trajectory", {}))
+    if scratchpad_snapshot_path is not None:
+        trajectory["scratchpad_snapshot_path"] = str(scratchpad_snapshot_path)
     return EpisodeTrajectory(
-        episode_id=str(episode_result.get("episode_id", episode_id)),
+        episode_id=final_episode_id,
         generation_id=generation_id,
         episode_index=episode_index,
         prompt_responses=list(episode_result.get("prompt_responses", [])),
-        trajectory=dict(episode_result.get("trajectory", {})),
+        trajectory=trajectory,
         space_freed_kb=space_freed_kb,
         episode_runtime_success=episode_runtime_success,
         success=success,
@@ -172,14 +269,22 @@ def run_single_episode(
         container_variation=variation_name,
         started_at=started_at,
         completed_at=completed_at,
-        duration_seconds=(
-            datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at)
-        ).total_seconds(),
+        duration_seconds=duration_seconds,
         partial=bool(episode_result.get("partial", False)),
         error_message=episode_result.get("error_message"),
         space_measurements=dict(episode_result.get("space_measurements", {})),
         filesystem_groups=list(episode_result.get("filesystem_groups", [])),
         measurement_errors=list(episode_result.get("measurement_errors", [])),
+        container_overhead_seconds=container_overhead_seconds,
+        episode_execution_seconds=episode_execution_seconds,
+        total_inference_ms=total_inference_ms,
+        inference_call_count=inference_call_count,
+        average_output_tokens_per_second=average_output_tokens_per_second,
+        inference_duty_cycle=(
+            (total_inference_ms / 1000) / duration_seconds
+            if duration_seconds > 0 and total_inference_ms > 0
+            else 0.0
+        ),
     )
 
 
@@ -200,6 +305,34 @@ def _make_progress_bar(
 
 def _generation_dir(output_dir: Path, generation_id: int) -> Path:
     return output_dir / f"generation_{generation_id}"
+
+
+def _scratchpad_snapshot_dir(output_dir: Path, generation_id: int) -> Path:
+    return _generation_dir(output_dir, generation_id) / "scratchpad_snapshots"
+
+
+def _snapshot_episode_scratchpad(
+    scratchpad_storage_path: Optional[str],
+    output_dir: Path,
+    generation_id: int,
+    episode_index: int,
+    episode_id: str,
+) -> Optional[Path]:
+    if not scratchpad_storage_path:
+        return None
+
+    safe_episode_id = episode_id.replace("/", "_").replace("\\", "_") or "unknown"
+    snapshot_path = _scratchpad_snapshot_dir(output_dir, generation_id) / (
+        f"episode_{episode_index:04d}_{safe_episode_id}.json"
+    )
+    return CrossEpisodeScratchpad.snapshot_storage(
+        Path(scratchpad_storage_path),
+        snapshot_path,
+        episode_id=episode_id,
+        episode_index=episode_index,
+        generation_id=generation_id,
+        snapshot_reason="episode_complete",
+    )
 
 
 def _load_existing_generation_data(
@@ -290,6 +423,7 @@ def run_generation(
         "successful rows",
         initial=generation_data.total_rows_collected,
     )
+    generation_started_at = time.perf_counter()
 
     try:
         for episode_index in range(start_episode_index, generation_config.max_episodes):
@@ -298,14 +432,6 @@ def run_generation(
                 >= generation_config.target_successful_rows
             ):
                 break
-            if (
-                metrics_collector is not None
-                and generation_config.resource_snapshot_interval_episodes > 0
-                and episode_index
-                % generation_config.resource_snapshot_interval_episodes
-                == 0
-            ):
-                metrics_collector.snapshot_resources()
 
             variation_index = select_variation_index(
                 generation_config.variation_strategy,
@@ -325,9 +451,42 @@ def run_generation(
                 run_id=run_id,
                 metrics_collector=metrics_collector,
             )
+            if (
+                metrics_collector is not None
+                and generation_config.resource_snapshot_interval_episodes > 0
+                and episode_index
+                % generation_config.resource_snapshot_interval_episodes
+                == 0
+            ):
+                resource_snapshot = metrics_collector.snapshot_resources()
+                episode.gpu_utilization_pct = resource_snapshot.gpu_utilization_pct
+                episode.cpu_utilization_pct = resource_snapshot.cpu_utilization_pct
             generation_data.add_episode(episode)
             episode_progress.update(1)
             rows_progress.update(generation_data.total_rows_collected - previous_rows)
+            elapsed_hours = (time.perf_counter() - generation_started_at) / 3600
+            if elapsed_hours > 0:
+                episode_postfix: dict[str, str] = {
+                    "ep/hr": f"{generation_data.total_episodes_run / elapsed_hours:.1f}"
+                }
+                if episode.average_output_tokens_per_second is not None:
+                    episode_postfix["tok/s"] = (
+                        f"{episode.average_output_tokens_per_second:.1f}"
+                    )
+                if episode.inference_duty_cycle is not None:
+                    episode_postfix["duty"] = f"{episode.inference_duty_cycle:.0%}"
+                if _is_number(episode.gpu_utilization_pct):
+                    episode_postfix["gpu"] = f"{episode.gpu_utilization_pct:.0f}%"
+                if _is_number(episode.cpu_utilization_pct):
+                    episode_postfix["cpu"] = f"{episode.cpu_utilization_pct:.0f}%"
+                episode_progress.set_postfix(episode_postfix)
+                rows_progress.set_postfix(
+                    {
+                        "rows/hr": (
+                            f"{generation_data.total_rows_collected / elapsed_hours:.1f}"
+                        )
+                    }
+                )
 
             if generation_config.checkpoint_every_episode:
                 append_episode_jsonl(episode.to_dict(), all_episodes_path)

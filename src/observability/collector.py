@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -105,14 +106,18 @@ class MetricsCollector:
         except Exception as exc:
             logger.error(f"Failed to record phase metric: {exc}")
 
-    def snapshot_resources(self) -> ResourceSnapshot:
+    def snapshot_resources(self, include_utilization: bool = True) -> ResourceSnapshot:
         if not self.enabled or not self.record_resources_enabled:
             return ResourceSnapshot()
 
-        return ResourceSnapshot(
+        snapshot = ResourceSnapshot(
             gpu_memory_mb=self._read_gpu_memory_mb(),
             host_memory_mb=self._read_host_memory_mb(),
         )
+        if include_utilization:
+            snapshot.gpu_utilization_pct = self._read_gpu_utilization_pct()
+            snapshot.cpu_utilization_pct = self._read_cpu_utilization_pct()
+        return snapshot
 
     def flush(self) -> Optional[str]:
         if not self.enabled:
@@ -215,3 +220,51 @@ class MetricsCollector:
                     return float(parts[1]) / 1024
 
         return None
+
+    def _read_gpu_utilization_pct(self) -> Optional[float]:
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            return float(utilization.gpu)
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        lines = result.stdout.strip().splitlines()
+        if not lines:
+            return None
+        try:
+            return float(lines[0])
+        except ValueError:
+            return None
+
+    def _read_cpu_utilization_pct(self) -> Optional[float]:
+        try:
+            import psutil
+        except ImportError:
+            return None
+
+        try:
+            return float(psutil.cpu_percent(interval=None))
+        except Exception:
+            return None

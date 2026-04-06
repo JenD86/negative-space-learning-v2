@@ -35,7 +35,7 @@ class MetricsGenner(Genner):
             result = self.inner.plist_completion(messages)
 
         latency_ms = (time.perf_counter() - started_at) * 1000
-        resources = self.collector.snapshot_resources()
+        resources = self.collector.snapshot_resources(include_utilization=False)
 
         match result:
             case Ok(inference_result):
@@ -53,9 +53,15 @@ class MetricsGenner(Genner):
                         usage=usage,
                         model=usage.model if usage is not None else None,
                         latency_ms=latency_ms,
-                        prompt_tokens_per_second=generation_rates["prompt_tokens_per_second"],
-                        output_tokens_per_second=generation_rates["output_tokens_per_second"],
-                        total_tokens_per_second=generation_rates["total_tokens_per_second"],
+                        prompt_tokens_per_second=generation_rates[
+                            "prompt_tokens_per_second"
+                        ],
+                        output_tokens_per_second=generation_rates[
+                            "output_tokens_per_second"
+                        ],
+                        total_tokens_per_second=generation_rates[
+                            "total_tokens_per_second"
+                        ],
                         gpu_memory_mb=resources.gpu_memory_mb,
                         host_memory_mb=resources.host_memory_mb,
                     )

@@ -69,6 +69,14 @@ class GenerationOrchestratorTests(unittest.TestCase):
         partial: bool = False,
         error_message: str | None = None,
         space_freed_kb: float = 64.0,
+        container_overhead_seconds: float | None = None,
+        episode_execution_seconds: float | None = None,
+        total_inference_ms: float | None = None,
+        inference_call_count: int | None = None,
+        average_output_tokens_per_second: float | None = None,
+        inference_duty_cycle: float | None = None,
+        gpu_utilization_pct: float | None = None,
+        cpu_utilization_pct: float | None = None,
     ) -> EpisodeTrajectory:
         return EpisodeTrajectory(
             episode_id=f"ep-{episode_index}",
@@ -108,6 +116,14 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 }
             ],
             measurement_errors=[],
+            container_overhead_seconds=container_overhead_seconds,
+            episode_execution_seconds=episode_execution_seconds,
+            total_inference_ms=total_inference_ms,
+            inference_call_count=inference_call_count,
+            average_output_tokens_per_second=average_output_tokens_per_second,
+            inference_duty_cycle=inference_duty_cycle,
+            gpu_utilization_pct=gpu_utilization_pct,
+            cpu_utilization_pct=cpu_utilization_pct,
         )
 
     def make_episode_result(
@@ -486,6 +502,77 @@ class GenerationOrchestratorTests(unittest.TestCase):
             self.assertTrue(scratchpad_path.exists())
 
     @patch("scripts.generate_training_data.run_episode_v2")
+    def test_episode_scratchpad_snapshot_survives_next_reset(
+        self, run_episode_v2: MagicMock
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            scratchpad_path = base_dir / "scratchpad.json"
+            config = self.make_config(base_dir, reset_scratchpad_between_episodes=True)
+            manager = MagicMock()
+            manager.populate.return_value = [
+                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
+            ]
+            manager.verify_population.return_value = {"success": True}
+
+            def write_scratchpad(*args: object, **kwargs: object) -> dict[str, object]:
+                episode_id = str(kwargs["episode_id"])
+                scratchpad_path.write_text(
+                    json.dumps(
+                        {
+                            "content": f"notes for {episode_id}",
+                            "char_count": len(f"notes for {episode_id}"),
+                            "max_chars": 1000,
+                            "last_updated": "2026-04-06T00:00:00",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return self.make_episode_result(episode_id=episode_id)
+
+            run_episode_v2.side_effect = write_scratchpad
+
+            first_episode = run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=0,
+                episode_index=0,
+                variation_index=0,
+                run_id="run-123",
+            )
+
+            snapshot_path = Path(first_episode.trajectory["scratchpad_snapshot_path"])
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(snapshot_path.exists())
+            self.assertEqual(snapshot_payload["episode_index"], 0)
+            self.assertEqual(snapshot_payload["episode_id"], first_episode.episode_id)
+            self.assertEqual(
+                snapshot_payload["scratchpad"]["content"],
+                f"notes for {first_episode.episode_id}",
+            )
+            self.assertTrue(scratchpad_path.exists())
+
+            run_episode_v2.side_effect = None
+            run_episode_v2.return_value = self.make_episode_result(episode_id="ep-1")
+
+            run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=0,
+                episode_index=1,
+                variation_index=0,
+                run_id="run-123",
+            )
+
+            self.assertFalse(scratchpad_path.exists())
+            self.assertEqual(snapshot_payload["snapshot_reason"], "episode_complete")
+
+    @patch("scripts.generate_training_data.run_episode_v2")
     def test_partial_episode_from_mode_exception_is_recorded(
         self,
         run_episode_v2: MagicMock,
@@ -675,6 +762,119 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 )
 
         self.assertEqual(metrics_collector.snapshot_resources.call_count, 3)
+
+    @patch("scripts.generate_training_data.run_episode_v2")
+    @patch("scripts.generate_training_data.time.perf_counter")
+    def test_run_single_episode_records_observability_metrics(
+        self,
+        perf_counter_mock: MagicMock,
+        run_episode_v2: MagicMock,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            manager = MagicMock()
+            manager.populate.return_value = [
+                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
+            ]
+            manager.verify_population.return_value = {"success": True}
+            manager.get_containers.return_value = [MagicMock(), MagicMock()]
+            metrics_collector = MagicMock()
+            metrics_collector.summary.side_effect = [
+                {
+                    "inference_calls": 2,
+                    "total_latency_ms": 1000.0,
+                    "total_output_tokens": 50,
+                },
+                {
+                    "inference_calls": 5,
+                    "total_latency_ms": 4000.0,
+                    "total_output_tokens": 350,
+                },
+            ]
+            run_episode_v2.return_value = self.make_episode_result(episode_id="ep-0")
+            perf_counter_mock.side_effect = [10.0, 12.0, 12.0, 20.0]
+
+            trajectory = run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=0,
+                episode_index=0,
+                variation_index=0,
+                run_id="run-123",
+                metrics_collector=metrics_collector,
+            )
+
+        self.assertEqual(trajectory.container_overhead_seconds, 2.0)
+        self.assertEqual(trajectory.episode_execution_seconds, 8.0)
+        self.assertEqual(trajectory.total_inference_ms, 3000.0)
+        self.assertEqual(trajectory.inference_call_count, 3)
+        self.assertEqual(trajectory.average_output_tokens_per_second, 100.0)
+        self.assertAlmostEqual(trajectory.inference_duty_cycle, 0.3)
+
+    def test_run_generation_updates_progress_postfix_with_observability_metrics(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_successful_rows=100,
+                max_episodes=1,
+                resource_snapshot_interval_episodes=1,
+            )
+            metrics_collector = MagicMock()
+            metrics_collector.snapshot_resources.return_value = MagicMock(
+                gpu_utilization_pct=82.0,
+                cpu_utilization_pct=37.0,
+            )
+            episode_progress = MagicMock()
+            rows_progress = MagicMock()
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+                patch(
+                    "scripts.generate_training_data._make_progress_bar",
+                    side_effect=[episode_progress, rows_progress],
+                ),
+                patch(
+                    "scripts.generate_training_data.time.perf_counter",
+                    side_effect=[0.0, 1800.0],
+                ),
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.return_value = self.make_episode(
+                    0,
+                    row_count=20,
+                    success=True,
+                    average_output_tokens_per_second=240.0,
+                    inference_duty_cycle=0.75,
+                )
+
+                run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    metrics_collector=metrics_collector,
+                )
+
+        postfix = episode_progress.set_postfix.call_args.args[0]
+        row_postfix = rows_progress.set_postfix.call_args.args[0]
+        self.assertEqual(postfix["tok/s"], "240.0")
+        self.assertEqual(postfix["duty"], "75%")
+        self.assertEqual(postfix["gpu"], "82%")
+        self.assertEqual(postfix["cpu"], "37%")
+        self.assertEqual(postfix["ep/hr"], "2.0")
+        self.assertEqual(row_postfix["rows/hr"], "40.0")
 
     def test_save_generation_data_output_structure(self) -> None:
         with TemporaryDirectory() as temp_dir:
