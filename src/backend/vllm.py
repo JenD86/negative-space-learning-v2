@@ -1,3 +1,4 @@
+import socket
 import subprocess
 import time
 from contextlib import contextmanager
@@ -23,6 +24,20 @@ HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/root/.cache/huggingface"
 
 
+def _get_host_ip() -> str:
+    """Get a non-loopback IP address for the host.
+
+    On some systems (e.g., NixOS/WSL2), Docker's network=host mode has a broken
+    loopback interface, so we need to use the host's actual network IP.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 def _is_bnb_model(model: str) -> bool:
     lower = model.lower()
     return "bnb-4bit" in lower or "bnb-8bit" in lower
@@ -37,7 +52,9 @@ def _normalize_vllm_model(model: str) -> str:
     return legacy_model_aliases.get(normalized_model, normalized_model)
 
 
-def _build_vllm_config(app_config: AppConfig, endpoint: str, timeout: int) -> VllmConfig:
+def _build_vllm_config(
+    app_config: AppConfig, endpoint: str, timeout: int
+) -> VllmConfig:
     config = VllmConfig()
     if app_config.model_name.startswith("vllm:"):
         config.model = app_config.model_name.split(":", 1)[1].strip()
@@ -51,19 +68,29 @@ def _build_vllm_config(app_config: AppConfig, endpoint: str, timeout: int) -> Vl
     config.gpu_memory_utilization = app_config.gpu_memory_utilization
     config.temperature = app_config.inference.temperature
     config.max_tokens = app_config.inference.max_tokens
+    if app_config.vllm is not None and app_config.vllm.chat_template_path:
+        chat_template_path = Path(app_config.vllm.chat_template_path)
+        config.chat_template = chat_template_path.read_text(encoding="utf-8")
     return config
 
 
 def _build_container_command(
     model: str,
     gpu_memory_utilization: float,
+    chat_template: str | None = None,
 ) -> list[str]:
     cmd = [
-        "--model", model,
-        "--host", "0.0.0.0",
-        "--port", "8000",
-        "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--model",
+        model,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--gpu-memory-utilization",
+        str(gpu_memory_utilization),
     ]
+    if chat_template:
+        cmd.extend(["--chat-template", chat_template])
     if _is_bnb_model(model):
         cmd.extend(["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"])
     return cmd
@@ -96,12 +123,17 @@ def _start_vllm_container(
     HF_CACHE_HOST.mkdir(parents=True, exist_ok=True)
 
     docker_cmd = [
-        "docker", "run", "-d",
-        "--name", name,
-        "--device", "nvidia.com/gpu=all",
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--device",
+        "nvidia.com/gpu=all",
         "--ipc=host",
-        "-p", f"127.0.0.1:{port}:8000",
-        "-v", f"{HF_CACHE_HOST}:{HF_CACHE_CONTAINER}",
+        "--network=host",
+        "-v",
+        f"{HF_CACHE_HOST}:{HF_CACHE_CONTAINER}",
         VLLM_IMAGE,
         *vllm_command,
     ]
@@ -109,22 +141,40 @@ def _start_vllm_container(
     logger.info(f"Docker command: {' '.join(docker_cmd)}")
     result = subprocess.run(docker_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to start vLLM container: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"Failed to start vLLM container: {result.stderr.strip()}")
 
 
 def _wait_for_vllm_ready(
-    models_url: str,
+    models_urls: str | list[str],
     container,
     timeout_s: int,
-) -> None:
-    deadline = time.time() + timeout_s
-    log_reported = 0
+    loopback_timeout_s: int = 60,
+) -> str:
+    """Wait for vLLM to become ready, trying multiple endpoints.
 
-    while time.time() < deadline:
-        if is_http_ready(models_url):
-            return
+    Returns the first URL that becomes ready.
+
+    Args:
+        models_urls: List of URLs to try (e.g., loopback and host IP)
+        container: Docker container handle
+        timeout_s: Total timeout for all endpoints
+        loopback_timeout_s: Timeout for first (loopback) endpoint before trying alternates
+    """
+    if isinstance(models_urls, str):
+        models_urls = [models_urls]
+
+    deadline = time.time() + timeout_s
+    start_time = time.time()
+    next_log_at = 30.0
+
+    primary_url = models_urls[0]
+    alternate_urls = models_urls[1:]
+
+    # First try the primary URL with a shorter timeout
+    primary_deadline = time.time() + min(loopback_timeout_s, timeout_s)
+    while time.time() < primary_deadline:
+        if is_http_ready(primary_url):
+            return primary_url
 
         container.reload()
         if container.status in ("exited", "dead"):
@@ -134,16 +184,46 @@ def _wait_for_vllm_ready(
                 f"Logs:\n{logs}"
             )
 
-        elapsed_now = timeout_s - int(deadline - time.time())
-        if elapsed_now > 0 and elapsed_now % 30 == 0 and elapsed_now > log_reported:
-            log_reported = elapsed_now
-            logger.info(f"Waiting for vLLM readiness... ({elapsed_now}s / {timeout_s}s)")
+        elapsed = time.time() - start_time
+        if elapsed >= next_log_at:
+            logger.info(
+                f"Waiting for vLLM readiness... ({int(elapsed)}s / {timeout_s}s)"
+            )
+            next_log_at += 30.0
+
+        time.sleep(2)
+
+    # If primary timed out, switch to alternate and continue polling
+    if alternate_urls:
+        current_url = alternate_urls[0]
+        logger.info(f"Loopback unreachable, switching to alternate: {current_url}")
+    else:
+        current_url = primary_url
+
+    while time.time() < deadline:
+        if is_http_ready(current_url):
+            return current_url
+
+        container.reload()
+        if container.status in ("exited", "dead"):
+            logs = container.logs(tail=50).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"vLLM container exited unexpectedly (status={container.status}). "
+                f"Logs:\n{logs}"
+            )
+
+        elapsed = time.time() - start_time
+        if elapsed >= next_log_at:
+            logger.info(
+                f"Waiting for vLLM readiness... ({int(elapsed)}s / {timeout_s}s)"
+            )
+            next_log_at += 30.0
 
         time.sleep(2)
 
     logs = container.logs(tail=30).decode("utf-8", errors="replace")
     raise TimeoutError(
-        f"Timed out waiting for vLLM readiness at {models_url} after {timeout_s}s. "
+        f"Timed out waiting for vLLM readiness at {current_url} after {timeout_s}s. "
         f"Recent logs:\n{logs}"
     )
 
@@ -156,7 +236,10 @@ def _build_vllm_smoke_test(client: OpenAI, config: VllmConfig):
             max_tokens=50,
             temperature=0.5,
         )
-        return test_response.choices[0].message.content
+        content = test_response.choices[0].message.content
+        if not isinstance(content, str):
+            raise RuntimeError("vLLM smoke test returned a non-text response")
+        return content
 
     return run_smoke_test
 
@@ -184,7 +267,7 @@ def _build_vllm_session(
 def setup_vllm(
     app_config: AppConfig,
     *,
-    endpoint: str = "http://localhost:8000",
+    endpoint: str = "http://127.0.0.1:8000",
     timeout: int = 500,
 ) -> Iterator[BackendSession]:
     config = _build_vllm_config(app_config, endpoint=endpoint, timeout=timeout)
@@ -204,6 +287,11 @@ def setup_vllm(
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
     port = parsed.port or 8000
 
+    # On some systems (NixOS/WSL2), Docker's network=host mode has a broken
+    # loopback interface. We detect this by trying loopback first, then fall
+    # back to the host's actual IP if loopback fails.
+    host_ip = _get_host_ip()
+
     logger.info(
         f"No server detected at {base_url}. "
         f"Starting vLLM Docker container for {config.model} on port {port}..."
@@ -213,7 +301,11 @@ def setup_vllm(
     container_name = _container_name(port)
     _remove_stale_container(docker_client, container_name)
 
-    vllm_command = _build_container_command(config.model, config.gpu_memory_utilization)
+    vllm_command = _build_container_command(
+        config.model,
+        config.gpu_memory_utilization,
+        config.chat_template,
+    )
     _start_vllm_container(container_name, port, vllm_command)
 
     # Get a handle to the container for lifecycle management
@@ -222,11 +314,31 @@ def setup_vllm(
 
     try:
         startup_timeout = max(config.timeout, timeout)
-        _wait_for_vllm_ready(models_url, container, startup_timeout)
 
+        # Build endpoints to try: original endpoint first, then host IP
+        models_urls = [models_url]
+        if host_ip != "127.0.0.1":
+            host_base_url = f"http://{host_ip}:{port}/v1"
+            host_models_url = f"{host_base_url}/models"
+            models_urls.append(host_models_url)
+            logger.info(
+                f"Will try alternate endpoint {host_models_url} if loopback fails"
+            )
+
+        working_url = _wait_for_vllm_ready(models_urls, container, startup_timeout)
+        base_url = working_url.rsplit("/models", 1)[0]
+        models_url = working_url
         logger.info(f"vLLM server is ready at {base_url}")
+
+        # Update client with working base_url
+        client = OpenAI(api_key=api_key, base_url=base_url)
+
         yield _build_vllm_session(
-            client, config, base_url, models_url, process=container,
+            client,
+            config,
+            base_url,
+            models_url,
+            process=container,
         )
     finally:
         logger.info(f"Stopping vLLM container '{container_name}'...")

@@ -67,6 +67,7 @@ class VllmConfig(ServerConfig):
 
     name: str = "vllm qwen"
     gpu_memory_utilization: float = 0.85
+    chat_template: Optional[str] = None
 
 
 @dataclass

@@ -25,6 +25,7 @@ target_successful_rows = 500
 max_episodes = 10000
 container_restart_interval = 10
 container_rebuild_interval = 20
+max_consecutive_verification_failures = 15  # Keep above restart interval so scheduled recovery can fire.
 success_threshold_kb = 0.0
 variation_strategy = "round_robin"
 # variation_random_seed = 42

@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -5,7 +6,11 @@ from src.genner.Base import Genner
 from src.typing.config import AppConfig
 
 
-def make_app_config(model_name: str, gpu_mem: float = 0.85) -> AppConfig:
+def make_app_config(
+    model_name: str,
+    gpu_mem: float = 0.85,
+    chat_template_path: str | None = None,
+) -> AppConfig:
     return AppConfig(
         dev=False,
         model_name=model_name,
@@ -16,9 +21,12 @@ def make_app_config(model_name: str, gpu_mem: float = 0.85) -> AppConfig:
         dynamic_container=False,
         docker_compose_dir="",
         train_data_save_folder="/tmp/train-data",
-        special_egc={"count": 1, "max_retries": 1},
-        strategy_list={"max_retries": 1},
-        strategy_code={"count": 1, "max_retries": 1},
+        special_egc=AppConfig.SpecialEGCConfig(count=1, max_retries=1),
+        strategy_list=AppConfig.StrategyListConfig(max_retries=1),
+        strategy_code=AppConfig.StrategyCodeConfig(count=1, max_retries=1),
+        vllm=AppConfig.VllmConfig(chat_template_path=chat_template_path)
+        if chat_template_path is not None
+        else None,
     )
 
 
@@ -45,6 +53,26 @@ class TestBnbModelDetection(unittest.TestCase):
 
 
 class TestBuildVllmDockerConfig(unittest.TestCase):
+    def test_build_vllm_config_loads_chat_template_from_path(self) -> None:
+        from src.backend.vllm import _build_vllm_config
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            handle.write("{{ messages[0]['content'] }}")
+            handle.flush()
+
+            config = make_app_config(
+                "vllm:unsloth/Qwen2.5-Coder-7B-bnb-4bit",
+                chat_template_path=handle.name,
+            )
+
+            vllm_config = _build_vllm_config(
+                config,
+                endpoint="http://127.0.0.1:8000",
+                timeout=500,
+            )
+
+        self.assertEqual(vllm_config.chat_template, "{{ messages[0]['content'] }}")
+
     def test_builds_container_command_for_standard_model(self) -> None:
         from src.backend.vllm import _build_container_command
 
@@ -62,6 +90,18 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
         self.assertIn("--quantization", cmd)
         self.assertIn("bitsandbytes", cmd)
         self.assertIn("--load-format", cmd)
+
+    def test_builds_container_command_with_chat_template(self) -> None:
+        from src.backend.vllm import _build_container_command
+
+        cmd = _build_container_command(
+            "unsloth/Qwen2.5-Coder-7B-bnb-4bit",
+            0.85,
+            "{{ messages[0]['content'] }}",
+        )
+
+        self.assertIn("--chat-template", cmd)
+        self.assertIn("{{ messages[0]['content'] }}", cmd)
 
 
 class TestVllmContainerLifecycle(unittest.TestCase):
@@ -205,6 +245,44 @@ class TestVllmContainerLifecycle(unittest.TestCase):
     @patch("src.backend.vllm._start_vllm_container")
     @patch("src.backend.vllm.DockerClient")
     @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_container_uses_chat_template_from_config(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from src.backend.vllm import setup_vllm
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_container.name = "nsl-vllm-8000"
+        mock_docker = MagicMock()
+        mock_docker.containers.get.return_value = mock_container
+        mock_docker_cls.from_env.return_value = mock_docker
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            handle.write("{{ messages[0]['content'] }}")
+            handle.flush()
+            config = make_app_config(
+                "vllm:unsloth/Qwen2.5-Coder-7B-bnb-4bit",
+                chat_template_path=handle.name,
+            )
+
+            with setup_vllm(config):
+                start_call = mock_start.call_args
+                vllm_command = start_call[0][2]
+                self.assertIn("--chat-template", vllm_command)
+                self.assertIn("{{ messages[0]['content'] }}", vllm_command)
+
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
     def test_cleanup_on_startup_failure(
         self,
         mock_http: MagicMock,
@@ -240,9 +318,7 @@ class TestVllmContainerLifecycle(unittest.TestCase):
 
 class TestStartVllmContainer(unittest.TestCase):
     @patch("src.backend.vllm.subprocess.run")
-    def test_calls_docker_run_with_gpu_and_volume(
-        self, mock_run: MagicMock
-    ) -> None:
+    def test_calls_docker_run_with_gpu_and_volume(self, mock_run: MagicMock) -> None:
         from src.backend.vllm import _start_vllm_container
 
         mock_run.return_value = MagicMock(returncode=0)
@@ -271,7 +347,7 @@ class TestWaitForVllmReady(unittest.TestCase):
     ) -> None:
         from src.backend.vllm import _wait_for_vllm_ready
 
-        mock_time.time.side_effect = [0, 1]
+        mock_time.time.side_effect = [0, 0, 0, 1]
         mock_http.return_value = True
         mock_container = MagicMock()
         mock_container.status = "running"
@@ -288,10 +364,12 @@ class TestWaitForVllmReady(unittest.TestCase):
         # time.time() is called multiple times per loop iteration.
         # Use a counter to return values that eventually exceed the deadline.
         call_count = 0
+
         def fake_time():
             nonlocal call_count
             call_count += 1
-            return 0 if call_count == 1 else (30 if call_count < 20 else 61)
+            return 0 if call_count == 1 else (30 if call_count < 5 else 91)
+
         mock_time.time.side_effect = fake_time
         mock_time.sleep = MagicMock()
         mock_container = MagicMock()
@@ -300,9 +378,7 @@ class TestWaitForVllmReady(unittest.TestCase):
         mock_container.logs.return_value = b"loading..."
 
         with self.assertRaises(TimeoutError):
-            _wait_for_vllm_ready(
-                "http://localhost:8000/v1/models", mock_container, 60
-            )
+            _wait_for_vllm_ready("http://localhost:8000/v1/models", mock_container, 60)
 
     @patch("src.backend.vllm.is_http_ready", return_value=False)
     @patch("src.backend.vllm.time")
@@ -311,7 +387,7 @@ class TestWaitForVllmReady(unittest.TestCase):
     ) -> None:
         from src.backend.vllm import _wait_for_vllm_ready
 
-        mock_time.time.side_effect = [0, 1, 2]
+        mock_time.time.side_effect = [0, 0, 0, 1]
         mock_time.sleep = MagicMock()
         mock_container = MagicMock()
         mock_container.status = "exited"
@@ -319,9 +395,7 @@ class TestWaitForVllmReady(unittest.TestCase):
         mock_container.logs.return_value = b"some error"
 
         with self.assertRaises(RuntimeError, msg="container exited"):
-            _wait_for_vllm_ready(
-                "http://localhost:8000/v1/models", mock_container, 60
-            )
+            _wait_for_vllm_ready("http://localhost:8000/v1/models", mock_container, 60)
 
 
 if __name__ == "__main__":

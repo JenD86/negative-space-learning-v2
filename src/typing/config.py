@@ -46,6 +46,11 @@ class AppConfig(BaseModel):
 
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
 
+    class VllmConfig(BaseModel):
+        chat_template_path: Optional[str] = None
+
+    vllm: Optional[VllmConfig] = None
+
     class ObservabilityConfig(BaseModel):
         enabled: bool = True
         record_inference: bool = True
