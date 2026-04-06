@@ -23,11 +23,27 @@ VLLM_IMAGE = "vllm/vllm-openai:latest"
 CONTAINER_NAME_PREFIX = "nsl-vllm"
 HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/root/.cache/huggingface"
+LOCAL_MODEL_CONTAINER_PATH = "/models/local"
+LOCAL_ADAPTER_CONTAINER_PATH = "/adapters/local"
 VLLM_NETWORK_MODE_ENV = "NSL_VLLM_NETWORK_MODE"
 LEGACY_VLLM_MODEL_ALIASES = {
     "qwen2.5-coder:7b-instruct": "Qwen/Qwen2.5-Coder-7B-Instruct",
     "qwen2.5:7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
 }
+
+
+def _resolve_model_for_container(
+    model: str, local_model_path: str | None
+) -> tuple[str, str | None, bool]:
+    """Returns (model_arg_for_vllm, host_mount_path, needs_bnb_flags)."""
+    if local_model_path:
+        return (
+            LOCAL_MODEL_CONTAINER_PATH,
+            str(Path(local_model_path).expanduser().resolve()),
+            False,
+        )
+    lower = model.lower()
+    return model, None, ("bnb-4bit" in lower or "bnb-8bit" in lower)
 
 
 def _get_host_ip() -> str:
@@ -109,6 +125,11 @@ def _build_vllm_config(
     if app_config.vllm is not None and app_config.vllm.chat_template_path:
         chat_template_path = Path(app_config.vllm.chat_template_path)
         config.chat_template = chat_template_path.read_text(encoding="utf-8")
+    if app_config.vllm is not None:
+        if app_config.vllm.served_model_name:
+            config.model = app_config.vllm.served_model_name
+        elif app_config.vllm.lora_adapter_path:
+            config.model = "adapter"
     return config
 
 
@@ -116,6 +137,9 @@ def _build_container_command(
     model: str,
     gpu_memory_utilization: float,
     chat_template: str | None = None,
+    lora_adapter_path: str | None = None,
+    served_model_name: str | None = None,
+    needs_bnb: bool | None = None,
 ) -> list[str]:
     cmd = [
         "--model",
@@ -129,9 +153,25 @@ def _build_container_command(
     ]
     if chat_template:
         cmd.extend(["--chat-template", chat_template])
-    lower_model = model.lower()
-    if "bnb-4bit" in lower_model or "bnb-8bit" in lower_model:
+    use_bnb = (
+        needs_bnb
+        if needs_bnb is not None
+        else ("bnb-4bit" in model.lower() or "bnb-8bit" in model.lower())
+    )
+    if use_bnb:
         cmd.extend(["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"])
+    if lora_adapter_path:
+        cmd.extend(
+            [
+                "--enable-lora",
+                "--lora-modules",
+                f"adapter={LOCAL_ADAPTER_CONTAINER_PATH}",
+                "--max-lora-rank",
+                "64",
+            ]
+        )
+    if served_model_name:
+        cmd.extend(["--served-model-name", served_model_name])
     return cmd
 
 
@@ -152,6 +192,7 @@ def _start_vllm_container(
     name: str,
     port: int,
     vllm_command: list[str],
+    extra_volumes: list[tuple[str, str]] | None = None,
 ) -> None:
     """Start a vLLM container using the docker CLI.
 
@@ -172,9 +213,10 @@ def _start_vllm_container(
         "--network=host",
         "-v",
         f"{HF_CACHE_HOST}:{HF_CACHE_CONTAINER}",
-        VLLM_IMAGE,
-        *vllm_command,
     ]
+    for host_path, container_path in extra_volumes or []:
+        docker_cmd.extend(["-v", f"{host_path}:{container_path}"])
+    docker_cmd.extend([VLLM_IMAGE, *vllm_command])
 
     logger.info(f"Docker command: {' '.join(docker_cmd)}")
     result = subprocess.run(docker_cmd, capture_output=True, text=True)
@@ -294,6 +336,14 @@ def setup_vllm(
     timeout: int = 500,
 ) -> Iterator[BackendSession]:
     config = _build_vllm_config(app_config, endpoint=endpoint, timeout=timeout)
+    source_model = (
+        app_config.model_name.split(":", 1)[1].strip()
+        if app_config.model_name.startswith("vllm:")
+        else app_config.model_name
+    )
+    source_model = LEGACY_VLLM_MODEL_ALIASES.get(
+        source_model.strip(), source_model.strip()
+    )
 
     endpoint = config.endpoint.rstrip("/")
     base_url = endpoint if endpoint.endswith("/v1") else f"{endpoint}/v1"
@@ -316,19 +366,53 @@ def setup_vllm(
 
     logger.info(
         f"No server detected at {base_url}. "
-        f"Starting vLLM Docker container for {config.model} on port {port}..."
+        f"Starting vLLM Docker container for {source_model} on port {port}..."
     )
 
     docker_client = DockerClient.from_env()
     container_name = _container_name(port)
     _remove_stale_container(docker_client, container_name)
 
+    vllm_cfg = app_config.vllm
+    local_model_path = vllm_cfg.local_model_path if vllm_cfg else None
+    lora_adapter_path = vllm_cfg.lora_adapter_path if vllm_cfg else None
+    served_model_name = vllm_cfg.served_model_name if vllm_cfg else None
+
+    effective_model, model_host_path, needs_bnb = _resolve_model_for_container(
+        source_model,
+        local_model_path,
+    )
+
+    if model_host_path and not served_model_name and not lora_adapter_path:
+        config.model = effective_model
+
+    extra_volumes: list[tuple[str, str]] = []
+    if model_host_path:
+        extra_volumes.append((model_host_path, LOCAL_MODEL_CONTAINER_PATH))
+    if lora_adapter_path:
+        extra_volumes.append(
+            (
+                str(Path(lora_adapter_path).expanduser().resolve()),
+                LOCAL_ADAPTER_CONTAINER_PATH,
+            )
+        )
+
     vllm_command = _build_container_command(
-        config.model,
+        effective_model,
         config.gpu_memory_utilization,
         config.chat_template,
+        lora_adapter_path=(
+            LOCAL_ADAPTER_CONTAINER_PATH if lora_adapter_path is not None else None
+        ),
+        served_model_name=served_model_name,
+        needs_bnb=needs_bnb,
     )
-    _start_vllm_container(container_name, port, vllm_command)
+    _start_vllm_container(
+        container_name,
+        port,
+        vllm_command,
+        extra_volumes=extra_volumes,
+    )
 
     container = docker_client.containers.get(container_name)
     logger.info(f"Started container '{container_name}' (id={container.short_id})")
@@ -388,4 +472,8 @@ def setup_vllm(
             logger.warning(f"Error removing container: {e}")
 
 
-__all__ = ["setup_vllm"]
+__all__ = [
+    "LOCAL_ADAPTER_CONTAINER_PATH",
+    "LOCAL_MODEL_CONTAINER_PATH",
+    "setup_vllm",
+]

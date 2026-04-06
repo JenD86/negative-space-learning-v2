@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from src.genner.Base import Genner
@@ -11,7 +12,19 @@ def make_app_config(
     model_name: str,
     gpu_mem: float = 0.85,
     chat_template_path: str | None = None,
+    local_model_path: str | None = None,
+    lora_adapter_path: str | None = None,
+    served_model_name: str | None = None,
 ) -> AppConfig:
+    has_vllm = any(
+        v is not None
+        for v in (
+            chat_template_path,
+            local_model_path,
+            lora_adapter_path,
+            served_model_name,
+        )
+    )
     return AppConfig(
         dev=False,
         model_name=model_name,
@@ -25,8 +38,13 @@ def make_app_config(
         special_egc=AppConfig.SpecialEGCConfig(count=1, max_retries=1),
         strategy_list=AppConfig.StrategyListConfig(max_retries=1),
         strategy_code=AppConfig.StrategyCodeConfig(count=1, max_retries=1),
-        vllm=AppConfig.VllmConfig(chat_template_path=chat_template_path)
-        if chat_template_path is not None
+        vllm=AppConfig.VllmConfig(
+            chat_template_path=chat_template_path,
+            local_model_path=local_model_path,
+            lora_adapter_path=lora_adapter_path,
+            served_model_name=served_model_name,
+        )
+        if has_vllm
         else None,
     )
 
@@ -80,7 +98,11 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
     def test_builds_container_command_for_standard_model(self) -> None:
         from src.backend.vllm import _build_container_command
 
-        cmd = _build_container_command("Qwen/Qwen2.5-7B-Instruct", 0.85)
+        cmd = _build_container_command(
+            "Qwen/Qwen2.5-7B-Instruct",
+            0.85,
+            needs_bnb=False,
+        )
         self.assertIn("--model", cmd)
         self.assertIn("Qwen/Qwen2.5-7B-Instruct", cmd)
         self.assertIn("--gpu-memory-utilization", cmd)
@@ -90,7 +112,11 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
     def test_builds_container_command_for_bnb_model(self) -> None:
         from src.backend.vllm import _build_container_command
 
-        cmd = _build_container_command("unsloth/Qwen2.5-Coder-7B-bnb-4bit", 0.85)
+        cmd = _build_container_command(
+            "unsloth/Qwen2.5-Coder-7B-bnb-4bit",
+            0.85,
+            needs_bnb=True,
+        )
         self.assertIn("--quantization", cmd)
         self.assertIn("bitsandbytes", cmd)
         self.assertIn("--load-format", cmd)
@@ -101,11 +127,87 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
         cmd = _build_container_command(
             "unsloth/Qwen2.5-Coder-7B-bnb-4bit",
             0.85,
-            "{{ messages[0]['content'] }}",
+            chat_template="{{ messages[0]['content'] }}",
+            needs_bnb=True,
         )
 
         self.assertIn("--chat-template", cmd)
         self.assertIn("{{ messages[0]['content'] }}", cmd)
+
+    def test_resolve_model_for_container_local_path(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_MODEL_CONTAINER_PATH,
+            _resolve_model_for_container,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_arg, host_mount, needs_bnb = _resolve_model_for_container(
+                "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+                tmpdir,
+            )
+
+            self.assertEqual(model_arg, LOCAL_MODEL_CONTAINER_PATH)
+            self.assertEqual(host_mount, str(Path(tmpdir).resolve()))
+            self.assertFalse(needs_bnb)
+
+    def test_resolve_model_for_container_hf_model(self) -> None:
+        from src.backend.vllm import _resolve_model_for_container
+
+        model_arg, host_mount, needs_bnb = _resolve_model_for_container(
+            "unsloth/Qwen2.5-Coder-7B-bnb-4bit",
+            None,
+        )
+
+        self.assertEqual(model_arg, "unsloth/Qwen2.5-Coder-7B-bnb-4bit")
+        self.assertIsNone(host_mount)
+        self.assertTrue(needs_bnb)
+
+    def test_build_container_command_with_lora(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_ADAPTER_CONTAINER_PATH,
+            _build_container_command,
+        )
+
+        cmd = _build_container_command(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+            0.85,
+            lora_adapter_path=LOCAL_ADAPTER_CONTAINER_PATH,
+            needs_bnb=False,
+        )
+
+        self.assertIn("--enable-lora", cmd)
+        self.assertIn("--lora-modules", cmd)
+        self.assertIn(f"adapter={LOCAL_ADAPTER_CONTAINER_PATH}", cmd)
+        self.assertIn("--max-lora-rank", cmd)
+        self.assertIn("64", cmd)
+
+    def test_build_container_command_local_no_bnb(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_MODEL_CONTAINER_PATH,
+            _build_container_command,
+        )
+
+        cmd = _build_container_command(
+            LOCAL_MODEL_CONTAINER_PATH,
+            0.85,
+            needs_bnb=False,
+        )
+
+        self.assertNotIn("--quantization", cmd)
+        self.assertNotIn("bitsandbytes", cmd)
+
+    def test_build_container_command_with_served_model_name(self) -> None:
+        from src.backend.vllm import _build_container_command
+
+        cmd = _build_container_command(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+            0.85,
+            served_model_name="nsl-qwen-v1",
+            needs_bnb=False,
+        )
+
+        self.assertIn("--served-model-name", cmd)
+        self.assertIn("nsl-qwen-v1", cmd)
 
 
 class TestVllmContainerLifecycle(unittest.TestCase):
@@ -348,6 +450,66 @@ class TestVllmContainerLifecycle(unittest.TestCase):
     @patch("src.backend.vllm._start_vllm_container")
     @patch("src.backend.vllm.DockerClient")
     @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_setup_vllm_with_local_model_path(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from src.backend.vllm import (
+            LOCAL_ADAPTER_CONTAINER_PATH,
+            LOCAL_MODEL_CONTAINER_PATH,
+            setup_vllm,
+        )
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_container.name = "nsl-vllm-8000"
+        mock_docker = MagicMock()
+        mock_docker.containers.get.return_value = mock_container
+        mock_docker_cls.from_env.return_value = mock_docker
+
+        with (
+            tempfile.TemporaryDirectory() as model_dir,
+            tempfile.TemporaryDirectory() as adapter_dir,
+        ):
+            config = make_app_config(
+                "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+                local_model_path=model_dir,
+                lora_adapter_path=adapter_dir,
+                served_model_name="nsl-qwen2.5-v1",
+            )
+
+            with setup_vllm(config) as session:
+                self.assertEqual(session.config.model, "nsl-qwen2.5-v1")
+
+            start_call = mock_start.call_args
+            vllm_command = start_call.args[2]
+            extra_volumes = start_call.kwargs["extra_volumes"]
+
+            self.assertIn(LOCAL_MODEL_CONTAINER_PATH, vllm_command)
+            self.assertIn("--enable-lora", vllm_command)
+            self.assertIn(f"adapter={LOCAL_ADAPTER_CONTAINER_PATH}", vllm_command)
+            self.assertIn("--served-model-name", vllm_command)
+            self.assertIn("nsl-qwen2.5-v1", vllm_command)
+            self.assertNotIn("--quantization", vllm_command)
+            self.assertEqual(
+                extra_volumes,
+                [
+                    (str(Path(model_dir).resolve()), LOCAL_MODEL_CONTAINER_PATH),
+                    (str(Path(adapter_dir).resolve()), LOCAL_ADAPTER_CONTAINER_PATH),
+                ],
+            )
+
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
     def test_cleanup_on_startup_failure(
         self,
         mock_http: MagicMock,
@@ -387,7 +549,7 @@ class TestStartVllmContainer(unittest.TestCase):
         from src.backend.vllm import _start_vllm_container
 
         mock_run.return_value = MagicMock(returncode=0)
-        _start_vllm_container("nsl-vllm-8000", 8000, ["--model", "test"])
+        _start_vllm_container("nsl-vllm-8000", 8000, ["--model", "test"], [])
 
         call_args = mock_run.call_args[0][0]
         self.assertIn("docker", call_args)
@@ -396,12 +558,28 @@ class TestStartVllmContainer(unittest.TestCase):
         self.assertIn("--model", call_args)
 
     @patch("src.backend.vllm.subprocess.run")
+    def test_start_vllm_container_with_extra_volumes(self, mock_run: MagicMock) -> None:
+        from src.backend.vllm import _start_vllm_container
+
+        mock_run.return_value = MagicMock(returncode=0)
+        _start_vllm_container(
+            "nsl-vllm-8000",
+            8000,
+            ["--model", "test"],
+            [("/host/model", "/models/local"), ("/host/adapter", "/adapters/local")],
+        )
+
+        call_args = mock_run.call_args.args[0]
+        self.assertIn("/host/model:/models/local", call_args)
+        self.assertIn("/host/adapter:/adapters/local", call_args)
+
+    @patch("src.backend.vllm.subprocess.run")
     def test_raises_on_docker_failure(self, mock_run: MagicMock) -> None:
         from src.backend.vllm import _start_vllm_container
 
         mock_run.return_value = MagicMock(returncode=1, stderr="no space left")
         with self.assertRaises(RuntimeError):
-            _start_vllm_container("nsl-vllm-8000", 8000, ["--model", "test"])
+            _start_vllm_container("nsl-vllm-8000", 8000, ["--model", "test"], [])
 
 
 class TestWaitForVllmReady(unittest.TestCase):
@@ -488,6 +666,222 @@ class TestWaitForVllmReady(unittest.TestCase):
             [call.args[0] for call in mock_http.call_args_list],
             [urls[0], urls[1], urls[2]],
         )
+
+
+class TestResolveModelForContainer(unittest.TestCase):
+    def test_local_path_returns_container_path_and_mount(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_MODEL_CONTAINER_PATH,
+            _resolve_model_for_container,
+        )
+
+        model_arg, host_path, needs_bnb = _resolve_model_for_container(
+            "Qwen/Qwen2.5-7B-Instruct", "/tmp/my-awq-model"
+        )
+        self.assertEqual(model_arg, LOCAL_MODEL_CONTAINER_PATH)
+        self.assertIsNotNone(host_path)
+        self.assertFalse(needs_bnb)
+
+    def test_hf_bnb_model_detects_bnb_flags(self) -> None:
+        from src.backend.vllm import _resolve_model_for_container
+
+        model_arg, host_path, needs_bnb = _resolve_model_for_container(
+            "unsloth/Qwen2.5-Coder-7B-bnb-4bit", None
+        )
+        self.assertEqual(model_arg, "unsloth/Qwen2.5-Coder-7B-bnb-4bit")
+        self.assertIsNone(host_path)
+        self.assertTrue(needs_bnb)
+
+    def test_hf_awq_model_no_bnb_flags(self) -> None:
+        from src.backend.vllm import _resolve_model_for_container
+
+        model_arg, host_path, needs_bnb = _resolve_model_for_container(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ", None
+        )
+        self.assertEqual(model_arg, "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ")
+        self.assertIsNone(host_path)
+        self.assertFalse(needs_bnb)
+
+
+class TestBuildContainerCommandExtensions(unittest.TestCase):
+    def test_lora_adapter_adds_enable_lora_flags(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_ADAPTER_CONTAINER_PATH,
+            _build_container_command,
+        )
+
+        cmd = _build_container_command(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+            0.85,
+            lora_adapter_path="/adapters/gen001",
+        )
+        self.assertIn("--enable-lora", cmd)
+        self.assertIn("--lora-modules", cmd)
+        self.assertIn(f"adapter={LOCAL_ADAPTER_CONTAINER_PATH}", cmd)
+        self.assertIn("--max-lora-rank", cmd)
+
+    def test_local_model_no_bnb_flags_when_needs_bnb_false(self) -> None:
+        from src.backend.vllm import (
+            LOCAL_MODEL_CONTAINER_PATH,
+            _build_container_command,
+        )
+
+        cmd = _build_container_command(
+            LOCAL_MODEL_CONTAINER_PATH,
+            0.85,
+            needs_bnb=False,
+        )
+        self.assertNotIn("--quantization", cmd)
+        self.assertNotIn("bitsandbytes", cmd)
+
+    def test_served_model_name_adds_flag(self) -> None:
+        from src.backend.vllm import _build_container_command
+
+        cmd = _build_container_command(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+            0.85,
+            served_model_name="nsl-qwen-v1",
+        )
+        self.assertIn("--served-model-name", cmd)
+        self.assertIn("nsl-qwen-v1", cmd)
+
+
+class TestStartVllmContainerExtraVolumes(unittest.TestCase):
+    @patch("src.backend.vllm.subprocess.run")
+    def test_extra_volumes_added_to_docker_cmd(self, mock_run: MagicMock) -> None:
+        from src.backend.vllm import _start_vllm_container
+
+        mock_run.return_value = MagicMock(returncode=0)
+        _start_vllm_container(
+            "nsl-vllm-8000",
+            8000,
+            ["--model", "/models/local"],
+            extra_volumes=[
+                ("/tmp/model", "/models/local"),
+                ("/tmp/adapter", "/adapters/local"),
+            ],
+        )
+        call_args = mock_run.call_args[0][0]
+        self.assertIn("-v", call_args)
+        self.assertIn("/tmp/model:/models/local", call_args)
+        self.assertIn("/tmp/adapter:/adapters/local", call_args)
+
+
+class TestSetupVllmWithLocalModel(unittest.TestCase):
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._get_host_ip", return_value="10.0.0.8")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_local_model_mounts_and_no_bnb(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_host_ip: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from docker.errors import NotFound
+        from src.backend.vllm import LOCAL_MODEL_CONTAINER_PATH, setup_vllm
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_docker = MagicMock()
+        mock_docker.containers.get.side_effect = [NotFound(""), mock_container]
+        mock_docker_cls.from_env.return_value = mock_docker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_app_config(
+                "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+                local_model_path=tmpdir,
+            )
+            with setup_vllm(config):
+                start_call = mock_start.call_args
+                vllm_command = start_call[0][2]
+                extra_volumes = start_call[1].get("extra_volumes", [])
+
+                self.assertIn(LOCAL_MODEL_CONTAINER_PATH, vllm_command)
+                self.assertNotIn("--quantization", vllm_command)
+                mounted_host_paths = [v[0] for v in extra_volumes]
+                self.assertIn(tmpdir, mounted_host_paths)
+
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._get_host_ip", return_value="10.0.0.8")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_lora_adapter_path_mounts_and_enables_lora(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_host_ip: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from docker.errors import NotFound
+        from src.backend.vllm import setup_vllm
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_docker = MagicMock()
+        mock_docker.containers.get.side_effect = [NotFound(""), mock_container]
+        mock_docker_cls.from_env.return_value = mock_docker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_app_config(
+                "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+                lora_adapter_path=tmpdir,
+            )
+            with setup_vllm(config):
+                start_call = mock_start.call_args
+                vllm_command = start_call[0][2]
+                extra_volumes = start_call[1].get("extra_volumes", [])
+
+                self.assertIn("--enable-lora", vllm_command)
+                self.assertIn("--lora-modules", vllm_command)
+                mounted_host_paths = [v[0] for v in extra_volumes]
+                self.assertIn(tmpdir, mounted_host_paths)
+
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._get_host_ip", return_value="10.0.0.8")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_served_model_name_updates_api_model(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_host_ip: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from docker.errors import NotFound
+        from src.backend.vllm import setup_vllm
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_docker = MagicMock()
+        mock_docker.containers.get.side_effect = [NotFound(""), mock_container]
+        mock_docker_cls.from_env.return_value = mock_docker
+
+        config = make_app_config(
+            "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+            served_model_name="nsl-qwen-v1",
+        )
+        with setup_vllm(config) as session:
+            self.assertEqual(session.config.model, "nsl-qwen-v1")
 
 
 if __name__ == "__main__":

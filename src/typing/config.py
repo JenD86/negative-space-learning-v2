@@ -48,6 +48,9 @@ class AppConfig(BaseModel):
 
     class VllmConfig(BaseModel):
         chat_template_path: Optional[str] = None
+        local_model_path: Optional[str] = None
+        lora_adapter_path: Optional[str] = None
+        served_model_name: Optional[str] = None
 
     vllm: Optional[VllmConfig] = None
 
