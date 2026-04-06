@@ -1076,6 +1076,7 @@ dependencies = [
     { name = "result" },
     { name = "toml" },
     { name = "typing-extensions" },
+    { name = "unsloth" },
 ]
 
 [package.optional-dependencies]
@@ -1092,7 +1093,6 @@ ml = [
     { name = "torch" },
     { name = "transformers" },
     { name = "trl" },
-    { name = "unsloth" },
     { name = "wandb" },
 ]
 
@@ -1124,7 +1124,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'ml'", specifier = ">=4.57.0" },
     { name = "trl", marker = "extra == 'ml'", specifier = ">=0.15.0" },
     { name = "typing-extensions", specifier = ">=4.0.0" },
-    { name = "unsloth", marker = "extra == 'ml'", specifier = ">=2026.4.2" },
+    { name = "unsloth", specifier = ">=2026.4.2" },
     { name = "wandb", marker = "extra == 'ml'", specifier = ">=0.19.0" },
 ]
 provides-extras = ["ml", "analysis"]

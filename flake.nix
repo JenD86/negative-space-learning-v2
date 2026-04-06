@@ -63,6 +63,12 @@
             export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
           fi
 
+          # Host networking on Nix-based setups can require the host IP rather
+          # than loopback when talking to the vLLM container.
+          if [ -z "$NSL_VLLM_NETWORK_MODE" ]; then
+            export NSL_VLLM_NETWORK_MODE=hostip
+          fi
+
           # Convenience symlinks for llama.cpp binaries in-repo.
           LLAMA_CPP_DIR="$PWD/.llama"
           mkdir -p "$LLAMA_CPP_DIR"

@@ -1,3 +1,4 @@
+import os
 import socket
 import subprocess
 import time
@@ -22,20 +23,66 @@ VLLM_IMAGE = "vllm/vllm-openai:latest"
 CONTAINER_NAME_PREFIX = "nsl-vllm"
 HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/root/.cache/huggingface"
+VLLM_NETWORK_MODE_ENV = "NSL_VLLM_NETWORK_MODE"
 
 
 def _get_host_ip() -> str:
-    """Get a non-loopback IP address for the host.
-
-    On some systems (e.g., NixOS/WSL2), Docker's network=host mode has a broken
-    loopback interface, so we need to use the host's actual network IP.
-    """
+    """Get a routable host IP for container-to-host connectivity."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"Failed to detect non-loopback host IP: {exc}")
         return "127.0.0.1"
+
+
+def _get_network_mode() -> str:
+    """Return the preferred vLLM network mode.
+
+    Supported values:
+    - auto: try the configured endpoint first, then a detected host IP
+    - loopback: only use the configured endpoint
+    - hostip: prefer the detected host IP endpoint
+    """
+
+    mode = os.getenv(VLLM_NETWORK_MODE_ENV, "auto").strip().lower()
+    if mode in {"auto", "loopback", "hostip"}:
+        return mode
+
+    logger.warning(
+        f"Invalid {VLLM_NETWORK_MODE_ENV} value '{mode}'; falling back to 'auto'"
+    )
+    return "auto"
+
+
+def _build_models_urls(
+    models_url: str,
+    host_ip: str | None,
+    port: int,
+    network_mode: str,
+    *,
+    scheme: str,
+) -> list[str]:
+    if network_mode == "loopback":
+        return [models_url]
+
+    if host_ip in (None, "127.0.0.1"):
+        if network_mode == "hostip":
+            logger.warning(
+                "Requested host IP networking, but no non-loopback host IP was "
+                "detected. Falling back to the configured endpoint."
+            )
+        return [models_url]
+
+    host_models_url = f"{scheme}://{host_ip}:{port}/v1/models"
+    if network_mode == "hostip":
+        return [host_models_url]
+
+    if host_models_url == models_url:
+        return [models_url]
+
+    return [models_url, host_models_url]
 
 
 def _is_bnb_model(model: str) -> bool:
@@ -116,9 +163,8 @@ def _start_vllm_container(
 ) -> None:
     """Start a vLLM container using the docker CLI.
 
-    We use subprocess instead of the Python SDK because the SDK doesn't
-    support CDI (Container Device Interface) for GPU passthrough, which
-    is required on NixOS/WSL2.
+    We use subprocess instead of the Python SDK because the CLI supports the
+    GPU device configuration used by the local environment.
     """
     HF_CACHE_HOST.mkdir(parents=True, exist_ok=True)
 
@@ -148,17 +194,17 @@ def _wait_for_vllm_ready(
     models_urls: str | list[str],
     container,
     timeout_s: int,
-    loopback_timeout_s: int = 60,
+    primary_timeout_s: int = 60,
 ) -> str:
     """Wait for vLLM to become ready, trying multiple endpoints.
 
     Returns the first URL that becomes ready.
 
     Args:
-        models_urls: List of URLs to try (e.g., loopback and host IP)
+        models_urls: Candidate URLs to try in order
         container: Docker container handle
         timeout_s: Total timeout for all endpoints
-        loopback_timeout_s: Timeout for first (loopback) endpoint before trying alternates
+        primary_timeout_s: Timeout for the first endpoint before trying alternates
     """
     if isinstance(models_urls, str):
         models_urls = [models_urls]
@@ -170,8 +216,7 @@ def _wait_for_vllm_ready(
     primary_url = models_urls[0]
     alternate_urls = models_urls[1:]
 
-    # First try the primary URL with a shorter timeout
-    primary_deadline = time.time() + min(loopback_timeout_s, timeout_s)
+    primary_deadline = time.time() + min(primary_timeout_s, timeout_s)
     while time.time() < primary_deadline:
         if is_http_ready(primary_url):
             return primary_url
@@ -193,10 +238,11 @@ def _wait_for_vllm_ready(
 
         time.sleep(2)
 
-    # If primary timed out, switch to alternate and continue polling
     if alternate_urls:
         current_url = alternate_urls[0]
-        logger.info(f"Loopback unreachable, switching to alternate: {current_url}")
+        logger.info(
+            f"Primary endpoint unreachable, switching to alternate: {current_url}"
+        )
     else:
         current_url = primary_url
 
@@ -276,21 +322,20 @@ def setup_vllm(
     base_url = endpoint if endpoint.endswith("/v1") else f"{endpoint}/v1"
     models_url = f"{base_url}/models"
     api_key = config.api_key or "dummy"
-    client = OpenAI(api_key=api_key, base_url=base_url)
 
     # If a server is already running (e.g. user started one manually), use it.
     if is_http_ready(models_url):
         logger.info(f"Using existing server at {base_url}")
+        client = OpenAI(api_key=api_key, base_url=base_url)
         yield _build_vllm_session(client, config, base_url, models_url)
         return
 
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    scheme = parsed.scheme or "http"
     port = parsed.port or 8000
+    network_mode = _get_network_mode()
 
-    # On some systems (NixOS/WSL2), Docker's network=host mode has a broken
-    # loopback interface. We detect this by trying loopback first, then fall
-    # back to the host's actual IP if loopback fails.
-    host_ip = _get_host_ip()
+    host_ip = None if network_mode == "loopback" else _get_host_ip()
 
     logger.info(
         f"No server detected at {base_url}. "
@@ -308,29 +353,43 @@ def setup_vllm(
     )
     _start_vllm_container(container_name, port, vllm_command)
 
-    # Get a handle to the container for lifecycle management
     container = docker_client.containers.get(container_name)
     logger.info(f"Started container '{container_name}' (id={container.short_id})")
 
     try:
         startup_timeout = max(config.timeout, timeout)
 
-        # Build endpoints to try: original endpoint first, then host IP
-        models_urls = [models_url]
-        if host_ip != "127.0.0.1":
-            host_base_url = f"http://{host_ip}:{port}/v1"
-            host_models_url = f"{host_base_url}/models"
-            models_urls.append(host_models_url)
+        models_urls = _build_models_urls(
+            models_url,
+            host_ip,
+            port,
+            network_mode,
+            scheme=scheme,
+        )
+        if len(models_urls) > 1:
             logger.info(
-                f"Will try alternate endpoint {host_models_url} if loopback fails"
+                f"Will try alternate endpoint {models_urls[1]} if {models_urls[0]} fails"
+            )
+        elif models_urls[0] != models_url:
+            logger.info(
+                f"Using host IP endpoint {models_urls[0]} due to "
+                f"{VLLM_NETWORK_MODE_ENV}={network_mode}"
             )
 
-        working_url = _wait_for_vllm_ready(models_urls, container, startup_timeout)
+        wait_kwargs = {}
+        if len(models_urls) == 1:
+            wait_kwargs["primary_timeout_s"] = startup_timeout
+
+        working_url = _wait_for_vllm_ready(
+            models_urls,
+            container,
+            startup_timeout,
+            **wait_kwargs,
+        )
         base_url = working_url.rsplit("/models", 1)[0]
         models_url = working_url
         logger.info(f"vLLM server is ready at {base_url}")
 
-        # Update client with working base_url
         client = OpenAI(api_key=api_key, base_url=base_url)
 
         yield _build_vllm_session(

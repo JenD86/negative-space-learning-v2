@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -53,6 +54,18 @@ class TestBnbModelDetection(unittest.TestCase):
 
 
 class TestBuildVllmDockerConfig(unittest.TestCase):
+    def test_get_network_mode_defaults_to_auto(self) -> None:
+        from src.backend.vllm import _get_network_mode
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_get_network_mode(), "auto")
+
+    def test_get_network_mode_falls_back_on_invalid_value(self) -> None:
+        from src.backend.vllm import _get_network_mode
+
+        with patch.dict(os.environ, {"NSL_VLLM_NETWORK_MODE": "invalid"}, clear=True):
+            self.assertEqual(_get_network_mode(), "auto")
+
     def test_build_vllm_config_loads_chat_template_from_path(self) -> None:
         from src.backend.vllm import _build_vllm_config
 
@@ -128,6 +141,7 @@ class TestVllmContainerLifecycle(unittest.TestCase):
 
     @patch("src.backend.vllm.get_genner")
     @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._get_host_ip", return_value="10.0.0.8")
     @patch("src.backend.vllm._wait_for_vllm_ready")
     @patch("src.backend.vllm._start_vllm_container")
     @patch("src.backend.vllm.DockerClient")
@@ -138,6 +152,7 @@ class TestVllmContainerLifecycle(unittest.TestCase):
         mock_docker_cls: MagicMock,
         mock_start: MagicMock,
         mock_wait: MagicMock,
+        mock_host_ip: MagicMock,
         mock_openai_cls: MagicMock,
         mock_get_genner: MagicMock,
     ) -> None:
@@ -163,8 +178,67 @@ class TestVllmContainerLifecycle(unittest.TestCase):
             self.assertIsNotNone(session.genner)
             mock_start.assert_called_once()
 
+        wait_urls = mock_wait.call_args.args[0]
+        self.assertEqual(
+            wait_urls,
+            [
+                "http://127.0.0.1:8000/v1/models",
+                "http://10.0.0.8:8000/v1/models",
+            ],
+        )
+        self.assertEqual(mock_openai_cls.call_count, 1)
+
         mock_container.stop.assert_called_once()
         mock_container.remove.assert_called_once()
+
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._get_host_ip", return_value="10.0.0.8")
+    @patch("src.backend.vllm._wait_for_vllm_ready")
+    @patch("src.backend.vllm._start_vllm_container")
+    @patch("src.backend.vllm.DockerClient")
+    @patch("src.backend.vllm.is_http_ready", return_value=False)
+    def test_hostip_mode_uses_only_host_ip_endpoint(
+        self,
+        mock_http: MagicMock,
+        mock_docker_cls: MagicMock,
+        mock_start: MagicMock,
+        mock_wait: MagicMock,
+        mock_host_ip: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from docker.errors import NotFound
+        from src.backend.vllm import setup_vllm
+
+        mock_get_genner.return_value = MagicMock(spec=Genner)
+        mock_container = MagicMock()
+        mock_container.name = "nsl-vllm-8000"
+        mock_container.id = "abc123"
+        mock_docker = MagicMock()
+        mock_docker.containers.get.side_effect = [
+            NotFound("not found"),
+            mock_container,
+        ]
+        mock_docker_cls.from_env.return_value = mock_docker
+        mock_wait.return_value = "http://10.0.0.8:8000/v1/models"
+
+        config = make_app_config("vllm:Qwen/Qwen2.5-7B-Instruct")
+
+        with patch.dict(os.environ, {"NSL_VLLM_NETWORK_MODE": "hostip"}, clear=True):
+            with setup_vllm(config) as session:
+                self.assertIsNotNone(session.genner)
+
+        self.assertEqual(
+            mock_wait.call_args.args[0], ["http://10.0.0.8:8000/v1/models"]
+        )
+        self.assertEqual(
+            mock_openai_cls.call_args.kwargs["base_url"], "http://10.0.0.8:8000/v1"
+        )
+        self.assertEqual(
+            mock_wait.call_args.kwargs["primary_timeout_s"],
+            max(config.inference.timeout, 500),
+        )
 
     @patch("src.backend.vllm.get_genner")
     @patch("src.backend.vllm.OpenAI")

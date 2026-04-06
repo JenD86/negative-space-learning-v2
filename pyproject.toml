@@ -17,6 +17,7 @@ dependencies = [
     "result>=0.17.0",
     "toml>=0.10.2",
     "typing-extensions>=4.0.0",
+    "unsloth>=2026.4.2",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,6 @@ ml = [
     "torch>=2.0.0",
     "transformers>=4.57.0",
     "trl>=0.15.0",
-    "unsloth>=2026.4.2",
     "wandb>=0.19.0",
 ]
 analysis = [
