@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 from loguru import logger
 from ollama import ChatResponse, Client, chat
@@ -165,14 +165,15 @@ class OllamaGenner(Genner):
 
     @staticmethod
     def get_usage_info(response: object) -> UsageInfo:
-        prompt_tokens = getattr(response, "prompt_eval_count", None)
-        completion_tokens = getattr(response, "eval_count", None)
+        response = cast(ChatResponse, response)
+        prompt_tokens = response.prompt_eval_count
+        completion_tokens = response.eval_count
         total_tokens = None
         if prompt_tokens is not None or completion_tokens is not None:
             total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
 
-        total_duration = getattr(response, "total_duration", None)
-        eval_duration = getattr(response, "eval_duration", None)
+        total_duration = response.total_duration
+        eval_duration = response.eval_duration
         latency_source = total_duration if total_duration is not None else eval_duration
         latency_ms = None
         if latency_source is not None:
@@ -183,6 +184,6 @@ class OllamaGenner(Genner):
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             latency_ms=latency_ms,
-            model=getattr(response, "model", None),
-            stop_reason=getattr(response, "done_reason", None),
+            model=response.model,
+            stop_reason=response.done_reason,
         )

@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
-from src.observability.types import InferenceMetric, PhaseMetric, ResourceSnapshot
+from src.observability.types import (
+    InferenceMetric,
+    PhaseMetric,
+    ResourceSnapshot,
+    UtilizationSummary,
+)
 
 if TYPE_CHECKING:
     from src.typing.config import AppConfig
@@ -32,6 +37,16 @@ class MetricsCollector:
         self.inference_metrics: list[InferenceMetric] = []
         self.phase_metrics: list[PhaseMetric] = []
         self._lock = threading.Lock()
+        # Background utilization sampling state
+        self._sampling_thread: threading.Thread | None = None
+        self._sampling_stop_event: threading.Event | None = None
+        self._utilization_peak_gpu: float | None = None
+        self._utilization_peak_cpu: float | None = None
+        self._utilization_sum_gpu: float = 0.0
+        self._utilization_sum_cpu: float = 0.0
+        self._utilization_gpu_count: int = 0
+        self._utilization_cpu_count: int = 0
+        self._utilization_sample_count: int = 0
         self._summary = {
             "inference_calls": 0,
             "phase_count": 0,
@@ -106,18 +121,119 @@ class MetricsCollector:
         except Exception as exc:
             logger.error(f"Failed to record phase metric: {exc}")
 
-    def snapshot_resources(self, include_utilization: bool = True) -> ResourceSnapshot:
+    def snapshot_resources(self) -> ResourceSnapshot:
         if not self.enabled or not self.record_resources_enabled:
             return ResourceSnapshot()
 
-        snapshot = ResourceSnapshot(
+        return ResourceSnapshot(
             gpu_memory_mb=self._read_gpu_memory_mb(),
             host_memory_mb=self._read_host_memory_mb(),
+            gpu_utilization_pct=self._read_gpu_utilization_pct(),
+            cpu_utilization_pct=self._read_cpu_utilization_pct(),
         )
-        if include_utilization:
-            snapshot.gpu_utilization_pct = self._read_gpu_utilization_pct()
-            snapshot.cpu_utilization_pct = self._read_cpu_utilization_pct()
-        return snapshot
+
+    def start_utilization_sampling(self, interval_seconds: float = 1.0) -> None:
+        """Start a background thread that polls GPU/CPU utilization at the given interval."""
+        if not self.enabled or not self.record_resources_enabled:
+            return
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+
+        # Stop any in-progress sampling before resetting
+        if self._sampling_stop_event is not None:
+            self._sampling_stop_event.set()
+            if self._sampling_thread is not None:
+                self._sampling_thread.join(timeout=2.0)
+        with self._lock:
+            self._utilization_peak_gpu = None
+            self._utilization_peak_cpu = None
+            self._utilization_sum_gpu = 0.0
+            self._utilization_sum_cpu = 0.0
+            self._utilization_gpu_count = 0
+            self._utilization_cpu_count = 0
+            self._utilization_sample_count = 0
+        self._record_utilization_sample(
+            self._read_gpu_utilization_pct(),
+            self._read_cpu_utilization_pct(),
+        )
+        self._sampling_stop_event = threading.Event()
+        self._sampling_thread = threading.Thread(
+            target=self._sampling_loop,
+            args=(interval_seconds,),
+            daemon=True,
+            name="utilization-sampler",
+        )
+        self._sampling_thread.start()
+
+    def stop_utilization_sampling(self) -> UtilizationSummary:
+        """Stop background sampling and return peak/average utilization for the episode."""
+        if self._sampling_stop_event is not None:
+            self._sampling_stop_event.set()
+        if self._sampling_thread is not None:
+            self._sampling_thread.join(timeout=5.0)
+            self._sampling_thread = None
+        self._sampling_stop_event = None
+
+        with self._lock:
+            peak_gpu = self._utilization_peak_gpu
+            peak_cpu = self._utilization_peak_cpu
+            gpu_count = self._utilization_gpu_count
+            cpu_count = self._utilization_cpu_count
+            avg_gpu = self._utilization_sum_gpu / gpu_count if gpu_count > 0 else None
+            avg_cpu = self._utilization_sum_cpu / cpu_count if cpu_count > 0 else None
+            total = self._utilization_sample_count
+            self._utilization_peak_gpu = None
+            self._utilization_peak_cpu = None
+            self._utilization_sum_gpu = 0.0
+            self._utilization_sum_cpu = 0.0
+            self._utilization_gpu_count = 0
+            self._utilization_cpu_count = 0
+            self._utilization_sample_count = 0
+
+        return UtilizationSummary(
+            peak_gpu_utilization_pct=peak_gpu,
+            peak_cpu_utilization_pct=peak_cpu,
+            avg_gpu_utilization_pct=avg_gpu,
+            avg_cpu_utilization_pct=avg_cpu,
+            sample_count=total,
+        )
+
+    def _sampling_loop(self, interval_seconds: float) -> None:
+        """Thread body: read GPU/CPU utilization, update peak and running sums."""
+        while True:
+            if self._sampling_stop_event is not None and self._sampling_stop_event.wait(
+                interval_seconds
+            ):
+                break
+            self._record_utilization_sample(
+                self._read_gpu_utilization_pct(),
+                self._read_cpu_utilization_pct(),
+            )
+
+    def _record_utilization_sample(
+        self,
+        gpu_pct: Optional[float],
+        cpu_pct: Optional[float],
+    ) -> None:
+        with self._lock:
+            if gpu_pct is not None:
+                if (
+                    self._utilization_peak_gpu is None
+                    or gpu_pct > self._utilization_peak_gpu
+                ):
+                    self._utilization_peak_gpu = gpu_pct
+                self._utilization_sum_gpu += gpu_pct
+                self._utilization_gpu_count += 1
+            if cpu_pct is not None:
+                if (
+                    self._utilization_peak_cpu is None
+                    or cpu_pct > self._utilization_peak_cpu
+                ):
+                    self._utilization_peak_cpu = cpu_pct
+                self._utilization_sum_cpu += cpu_pct
+                self._utilization_cpu_count += 1
+            if gpu_pct is not None or cpu_pct is not None:
+                self._utilization_sample_count += 1
 
     def flush(self) -> Optional[str]:
         if not self.enabled:

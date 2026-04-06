@@ -43,11 +43,7 @@ class ContainerManager:
         containers = self.docker_client.containers.list()
         refreshed_names: List[str] = []
         for container in containers:
-            container_name = getattr(container, "name", "")
-            if not isinstance(container_name, str):
-                container_name = getattr(container, "_mock_name", "") or str(
-                    container_name
-                )
+            container_name = container.name or ""
             if (
                 "special-learn-compose" in container_name
                 and "service" in container_name

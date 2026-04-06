@@ -11,7 +11,6 @@ from scripts.generate_training_data import (
     save_generation_data,
     select_variation_index,
 )
-from src.observability.types import ResourceSnapshot
 from src.typing.config import AppConfig
 from src.typing.trajectory import EpisodeTrajectory, GenerationData
 
@@ -76,8 +75,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
         inference_call_count: int | None = None,
         average_output_tokens_per_second: float | None = None,
         inference_duty_cycle: float | None = None,
-        gpu_utilization_pct: float | None = None,
-        cpu_utilization_pct: float | None = None,
+        peak_gpu_utilization_pct: float | None = None,
+        peak_cpu_utilization_pct: float | None = None,
+        avg_gpu_utilization_pct: float | None = None,
+        avg_cpu_utilization_pct: float | None = None,
     ) -> EpisodeTrajectory:
         return EpisodeTrajectory(
             episode_id=f"ep-{episode_index}",
@@ -123,8 +124,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             inference_call_count=inference_call_count,
             average_output_tokens_per_second=average_output_tokens_per_second,
             inference_duty_cycle=inference_duty_cycle,
-            gpu_utilization_pct=gpu_utilization_pct,
-            cpu_utilization_pct=cpu_utilization_pct,
+            peak_gpu_utilization_pct=peak_gpu_utilization_pct,
+            peak_cpu_utilization_pct=peak_cpu_utilization_pct,
+            avg_gpu_utilization_pct=avg_gpu_utilization_pct,
+            avg_cpu_utilization_pct=avg_cpu_utilization_pct,
         )
 
     def make_episode_result(
@@ -446,6 +449,49 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(trajectory.container_variation, "variation_4_large_sparse")
         self.assertEqual(len(trajectory.prompt_responses), 2)
 
+    def test_run_single_episode_records_utilization_on_verification_failure(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            manager = MagicMock()
+            manager.populate.return_value = [
+                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
+            ]
+            manager.verify_population.return_value = {"success": False}
+            metrics_collector = MagicMock()
+            metrics_collector.summary.return_value = {}
+            metrics_collector.stop_utilization_sampling.return_value = MagicMock(
+                peak_gpu_utilization_pct=34.0,
+                peak_cpu_utilization_pct=15.0,
+                avg_gpu_utilization_pct=21.0,
+                avg_cpu_utilization_pct=10.0,
+            )
+
+            trajectory = run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=0,
+                episode_index=0,
+                variation_index=0,
+                run_id="run-123",
+                metrics_collector=metrics_collector,
+            )
+
+        self.assertFalse(trajectory.success)
+        self.assertEqual(
+            trajectory.error_message, "container population verification failed"
+        )
+        self.assertEqual(trajectory.peak_gpu_utilization_pct, 34.0)
+        self.assertEqual(trajectory.peak_cpu_utilization_pct, 15.0)
+        self.assertEqual(trajectory.avg_gpu_utilization_pct, 21.0)
+        self.assertEqual(trajectory.avg_cpu_utilization_pct, 10.0)
+        metrics_collector.start_utilization_sampling.assert_called_once_with()
+        metrics_collector.stop_utilization_sampling.assert_called_once_with()
+
     @patch("scripts.generate_training_data.run_episode_v2")
     def test_run_single_episode_requires_population_results(
         self, run_episode_v2: MagicMock
@@ -751,7 +797,50 @@ class GenerationOrchestratorTests(unittest.TestCase):
         first_call = run_single_episode_mock.call_args_list[0]
         self.assertEqual(first_call.kwargs["episode_index"], 2)
 
-    def test_metrics_resource_snapshots_recorded(self) -> None:
+    @patch("scripts.generate_training_data.run_episode_v2")
+    def test_run_single_episode_records_background_utilization_summary(
+        self,
+        run_episode_v2: MagicMock,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            manager = MagicMock()
+            manager.populate.return_value = [
+                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
+            ]
+            manager.verify_population.return_value = {"success": True}
+            manager.get_containers.return_value = [MagicMock(), MagicMock()]
+            metrics_collector = MagicMock()
+            metrics_collector.summary.side_effect = [{}, {}]
+            metrics_collector.stop_utilization_sampling.return_value = MagicMock(
+                peak_gpu_utilization_pct=82.0,
+                peak_cpu_utilization_pct=37.0,
+                avg_gpu_utilization_pct=51.5,
+                avg_cpu_utilization_pct=24.0,
+            )
+            run_episode_v2.return_value = self.make_episode_result(episode_id="ep-0")
+
+            trajectory = run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=0,
+                episode_index=0,
+                variation_index=0,
+                run_id="run-123",
+                metrics_collector=metrics_collector,
+            )
+
+        metrics_collector.start_utilization_sampling.assert_called_once_with()
+        metrics_collector.stop_utilization_sampling.assert_called_once_with()
+        self.assertEqual(trajectory.peak_gpu_utilization_pct, 82.0)
+        self.assertEqual(trajectory.peak_cpu_utilization_pct, 37.0)
+        self.assertEqual(trajectory.avg_gpu_utilization_pct, 51.5)
+        self.assertEqual(trajectory.avg_cpu_utilization_pct, 24.0)
+
+    def test_run_generation_does_not_snapshot_resources_for_utilization(self) -> None:
         with TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
             config = self.make_config(
@@ -761,7 +850,6 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 resource_snapshot_interval_episodes=2,
             )
             metrics_collector = MagicMock()
-            metrics_collector.snapshot_resources.return_value = ResourceSnapshot()
             with (
                 patch(
                     "scripts.generate_training_data.ContainerManager"
@@ -788,7 +876,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
                     metrics_collector=metrics_collector,
                 )
 
-        self.assertEqual(metrics_collector.snapshot_resources.call_count, 3)
+        metrics_collector.snapshot_resources.assert_not_called()
 
     @patch("scripts.generate_training_data.run_episode_v2")
     @patch("scripts.generate_training_data.time.perf_counter")
@@ -819,6 +907,12 @@ class GenerationOrchestratorTests(unittest.TestCase):
                     "total_output_tokens": 350,
                 },
             ]
+            metrics_collector.stop_utilization_sampling.return_value = MagicMock(
+                peak_gpu_utilization_pct=82.0,
+                peak_cpu_utilization_pct=37.0,
+                avg_gpu_utilization_pct=51.5,
+                avg_cpu_utilization_pct=24.0,
+            )
             run_episode_v2.return_value = self.make_episode_result(episode_id="ep-0")
             perf_counter_mock.side_effect = [10.0, 12.0, 12.0, 20.0]
 
@@ -840,6 +934,12 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(trajectory.inference_call_count, 3)
         self.assertEqual(trajectory.average_output_tokens_per_second, 100.0)
         self.assertAlmostEqual(trajectory.inference_duty_cycle, 0.3)
+        self.assertEqual(trajectory.peak_gpu_utilization_pct, 82.0)
+        self.assertEqual(trajectory.peak_cpu_utilization_pct, 37.0)
+        self.assertEqual(trajectory.avg_gpu_utilization_pct, 51.5)
+        self.assertEqual(trajectory.avg_cpu_utilization_pct, 24.0)
+        metrics_collector.start_utilization_sampling.assert_called_once_with()
+        metrics_collector.stop_utilization_sampling.assert_called_once_with()
 
     def test_run_generation_updates_progress_postfix_with_observability_metrics(
         self,
@@ -853,10 +953,6 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 resource_snapshot_interval_episodes=1,
             )
             metrics_collector = MagicMock()
-            metrics_collector.snapshot_resources.return_value = MagicMock(
-                gpu_utilization_pct=82.0,
-                cpu_utilization_pct=37.0,
-            )
             episode_progress = MagicMock()
             rows_progress = MagicMock()
             with (
@@ -883,6 +979,8 @@ class GenerationOrchestratorTests(unittest.TestCase):
                     success=True,
                     average_output_tokens_per_second=240.0,
                     inference_duty_cycle=0.75,
+                    peak_gpu_utilization_pct=82.0,
+                    peak_cpu_utilization_pct=37.0,
                 )
 
                 run_generation(

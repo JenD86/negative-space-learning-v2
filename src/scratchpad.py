@@ -72,10 +72,13 @@ class CrossEpisodeScratchpad:
         """Load a persisted scratchpad payload from disk."""
         if not storage_path.exists():
             return None
-        with open(storage_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        try:
+            with open(storage_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (json.JSONDecodeError, ValueError):
+            return None
         if not isinstance(payload, dict):
-            raise ValueError("Scratchpad payload must be a JSON object")
+            return None
         return payload
 
     @classmethod
@@ -137,7 +140,7 @@ class CrossEpisodeScratchpad:
         try:
             payload = self.load_storage_payload(self.storage_path)
             if payload is not None:
-                self.content = str(payload.get("content", ""))
+                self.content = payload.get("content", "")
                 # Update max_chars if changed in config
                 if len(self.content) > self.max_chars:
                     self.append("", None)  # Trigger trim

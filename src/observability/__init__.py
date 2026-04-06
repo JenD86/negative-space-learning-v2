@@ -9,6 +9,7 @@ if TYPE_CHECKING:
         PhaseMetric,
         ResourceSnapshot,
         UsageInfo,
+        UtilizationSummary,
     )
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "PhaseMetric",
     "ResourceSnapshot",
     "UsageInfo",
+    "UtilizationSummary",
 ]
 
 
@@ -37,6 +39,7 @@ def __getattr__(name: str) -> Any:
         "PhaseMetric",
         "ResourceSnapshot",
         "UsageInfo",
+        "UtilizationSummary",
     }:
         from src.observability import types as observability_types
 

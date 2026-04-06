@@ -7,7 +7,6 @@ from src.typing.config import AppConfig
 from src.backend.resolver import resolve_backend_context
 
 
-
 def make_app_config(model_name: str) -> AppConfig:
     return AppConfig(
         dev=False,
@@ -97,6 +96,7 @@ class BackendContextBehaviorTests(unittest.TestCase):
         get_genner: MagicMock,
     ) -> None:
         fake_genner = MagicMock(spec=Genner)
+        fake_genner.client = object()
         get_genner.return_value = fake_genner
 
         context = resolve_backend_context(make_app_config("qwen-cleanup-merged"))
@@ -104,6 +104,7 @@ class BackendContextBehaviorTests(unittest.TestCase):
 
         with context as session:
             self.assertIs(session.genner, fake_genner)
+            self.assertIs(session.client, fake_genner.client)
 
 
 if __name__ == "__main__":

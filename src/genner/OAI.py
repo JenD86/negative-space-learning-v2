@@ -1,7 +1,7 @@
 import ast
 import json
 import re
-from typing import Any, List, Tuple, cast, Optional
+from typing import Any, List, Optional, Protocol, Sequence, Tuple, cast
 
 from openai import OpenAI
 from result import Result, Ok, Err, UnwrapError
@@ -44,6 +44,22 @@ class OAIConfig(NamedTuple):
     model: str = "gpt-3.5-turbo"
     max_tokens: int = 500
     temperature: float = 0.5
+
+
+class OAIUsageResponse(Protocol):
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+class OAIChoiceResponse(Protocol):
+    finish_reason: str | None
+
+
+class OAIChatResponse(Protocol):
+    usage: OAIUsageResponse | None
+    choices: Sequence[OAIChoiceResponse]
+    model: str
 
 
 class OAIGenner(Genner):
@@ -187,24 +203,22 @@ class OAIGenner(Genner):
 
     @staticmethod
     def get_usage_info(response: object) -> UsageInfo:
-        usage = getattr(response, "usage", None)
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
+        response = cast(OAIChatResponse, response)
+        usage = response.usage
+        prompt_tokens = usage.prompt_tokens if usage is not None else None
+        completion_tokens = usage.completion_tokens if usage is not None else None
+        total_tokens = usage.total_tokens if usage is not None else None
         if total_tokens is None and (
             prompt_tokens is not None or completion_tokens is not None
         ):
             total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
 
-        choices = getattr(response, "choices", None) or []
-        stop_reason = None
-        if choices:
-            stop_reason = getattr(choices[0], "finish_reason", None)
+        stop_reason = response.choices[0].finish_reason if response.choices else None
 
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            model=getattr(response, "model", None),
+            model=response.model,
             stop_reason=stop_reason,
         )

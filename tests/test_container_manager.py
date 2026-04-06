@@ -147,9 +147,13 @@ class ContainerManagerTests(unittest.TestCase):
 
     def test_refresh_container_ids_after_rebuild_or_restart(self) -> None:
         manager, docker_client, _, _ = self.make_manager()
+        refreshed_a = MagicMock()
+        refreshed_a.name = "special-learn-compose_service-a_9"
+        refreshed_b = MagicMock()
+        refreshed_b.name = "special-learn-compose_service-b_9"
         docker_client.containers.list.return_value = [
-            MagicMock(**{"name": "special-learn-compose_service-a_9"}),
-            MagicMock(**{"name": "special-learn-compose_service-b_9"}),
+            refreshed_a,
+            refreshed_b,
         ]
 
         refreshed = manager.refresh_container_ids()

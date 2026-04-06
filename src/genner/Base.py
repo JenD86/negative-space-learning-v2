@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from result import Result
 
@@ -9,8 +9,13 @@ from src.typing.alias import RawResponse, ParsedCode, ParsedList
 
 
 class Genner(ABC):
+    client: Any = None
+    collector: Any = None
+
     def __init__(self, identifier: str):
         self.identifier = identifier
+        self.client = None
+        self.collector = None
 
     @abstractmethod
     def plist_completion(self, messages: List[Message]) -> Result[InferenceResult, str]:

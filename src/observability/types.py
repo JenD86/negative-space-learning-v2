@@ -55,3 +55,12 @@ class ResourceSnapshot:
     host_memory_mb: Optional[float] = None
     gpu_utilization_pct: Optional[float] = None
     cpu_utilization_pct: Optional[float] = None
+
+
+@dataclass
+class UtilizationSummary:
+    peak_gpu_utilization_pct: Optional[float] = None
+    peak_cpu_utilization_pct: Optional[float] = None
+    avg_gpu_utilization_pct: Optional[float] = None
+    avg_cpu_utilization_pct: Optional[float] = None
+    sample_count: int = 0

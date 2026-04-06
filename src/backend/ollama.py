@@ -15,7 +15,7 @@ def setup_ollama(app_config: AppConfig) -> Iterator[BackendSession]:
     genner = get_genner("qwen", qwen_config=qwen_config)
     yield BackendSession(
         genner=genner,
-        client=getattr(genner, "client", None),
+        client=genner.client,
         config=qwen_config,
     )
 

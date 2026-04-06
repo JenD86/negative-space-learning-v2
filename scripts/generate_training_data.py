@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from tqdm import tqdm
 
 import docker
 import pydantic
@@ -17,7 +18,8 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.container import ContainerManager
-from src.helper import generate_readable_run_id, unflatten_toml_dict
+from src.helper import generate_readable_run_id, humanize_number, unflatten_toml_dict
+from src.observability.types import UtilizationSummary
 from src.scratchpad import CrossEpisodeScratchpad
 from src.typing.config import AppConfig
 from src.typing.training import (
@@ -27,6 +29,9 @@ from src.typing.training import (
     save_generation_training_data,
 )
 from src.typing.trajectory import EpisodeTrajectory, GenerationData
+
+from src.backend import resolve_backend_context
+from src.observability import MetricsCollector, MetricsGenner
 
 
 class _NullProgressBar:
@@ -111,20 +116,45 @@ def run_single_episode(
     output_dir = Path(generation_config.generation_output_dir)
     episode_id = f"ep_gen{generation_id}_{episode_index:04d}_{int(time.time())}"
     before_summary = metrics_collector.summary() if metrics_collector else {}
+
+    utilization_summary = UtilizationSummary()
+    utilization_sampling_started = False
+
+    def _stop_utilization_sampling() -> UtilizationSummary:
+        nonlocal utilization_summary, utilization_sampling_started
+        if utilization_sampling_started and metrics_collector is not None:
+            utilization_summary = metrics_collector.stop_utilization_sampling()
+            utilization_sampling_started = False
+        return utilization_summary
+
+    if metrics_collector is not None:
+        metrics_collector.start_utilization_sampling()
+        utilization_sampling_started = True
+
     container_started_at = time.perf_counter()
-    population_results = container_manager.populate(variation_index)
+    try:
+        population_results = container_manager.populate(variation_index)
+    except Exception:
+        _stop_utilization_sampling()
+        raise
     if not population_results:
+        _stop_utilization_sampling()
         raise RuntimeError("container_manager.populate returned no results")
     primary_population = population_results[0]
     variation_name = primary_population.variation_name
     expected_kb = primary_population.expected_kb
-    verification = container_manager.verify_population(
-        expected_kb,
-        generation_config.population_verification_tolerance,
-    )
+    try:
+        verification = container_manager.verify_population(
+            expected_kb,
+            generation_config.population_verification_tolerance,
+        )
+    except Exception:
+        _stop_utilization_sampling()
+        raise
 
     if not verification["success"]:
         container_overhead_seconds = time.perf_counter() - container_started_at
+        utilization_summary = _stop_utilization_sampling()
         completed_at = datetime.now().isoformat()
         return EpisodeTrajectory(
             episode_id=episode_id,
@@ -146,6 +176,10 @@ def run_single_episode(
             total_inference_ms=0.0,
             inference_call_count=0,
             inference_duty_cycle=0.0,
+            peak_gpu_utilization_pct=utilization_summary.peak_gpu_utilization_pct,
+            peak_cpu_utilization_pct=utilization_summary.peak_cpu_utilization_pct,
+            avg_gpu_utilization_pct=utilization_summary.avg_gpu_utilization_pct,
+            avg_cpu_utilization_pct=utilization_summary.avg_cpu_utilization_pct,
         )
 
     scratchpad_storage_path = episode_config.scratchpad_storage_path
@@ -168,6 +202,7 @@ def run_single_episode(
         )
     except Exception as exc:
         episode_execution_seconds = time.perf_counter() - execution_started_at
+        utilization_summary = _stop_utilization_sampling()
         after_summary = metrics_collector.summary() if metrics_collector else {}
         total_inference_ms, inference_call_count, average_output_tokens_per_second = (
             _compute_episode_inference_metrics(before_summary, after_summary)
@@ -209,9 +244,14 @@ def run_single_episode(
                 if duration_seconds > 0 and total_inference_ms > 0
                 else 0.0
             ),
+            peak_gpu_utilization_pct=utilization_summary.peak_gpu_utilization_pct,
+            peak_cpu_utilization_pct=utilization_summary.peak_cpu_utilization_pct,
+            avg_gpu_utilization_pct=utilization_summary.avg_gpu_utilization_pct,
+            avg_cpu_utilization_pct=utilization_summary.avg_cpu_utilization_pct,
         )
 
     episode_execution_seconds = time.perf_counter() - execution_started_at
+    utilization_summary = _stop_utilization_sampling()
     after_summary = metrics_collector.summary() if metrics_collector else {}
     total_inference_ms, inference_call_count, average_output_tokens_per_second = (
         _compute_episode_inference_metrics(before_summary, after_summary)
@@ -261,6 +301,10 @@ def run_single_episode(
             if duration_seconds > 0 and total_inference_ms > 0
             else 0.0
         ),
+        peak_gpu_utilization_pct=utilization_summary.peak_gpu_utilization_pct,
+        peak_cpu_utilization_pct=utilization_summary.peak_cpu_utilization_pct,
+        avg_gpu_utilization_pct=utilization_summary.avg_gpu_utilization_pct,
+        avg_cpu_utilization_pct=utilization_summary.avg_cpu_utilization_pct,
     )
 
 
@@ -271,10 +315,6 @@ def _make_progress_bar(
     initial: int = 0,
 ):
     if not enabled:
-        return _NullProgressBar(total=total, initial=initial)
-    try:
-        from tqdm import tqdm
-    except ImportError:
         return _NullProgressBar(total=total, initial=initial)
     return tqdm(total=total, desc=description, initial=initial)
 
@@ -427,23 +467,15 @@ def run_generation(
                 run_id=run_id,
                 metrics_collector=metrics_collector,
             )
-            if (
-                metrics_collector is not None
-                and generation_config.resource_snapshot_interval_episodes > 0
-                and episode_index
-                % generation_config.resource_snapshot_interval_episodes
-                == 0
-            ):
-                resource_snapshot = metrics_collector.snapshot_resources()
-                episode.gpu_utilization_pct = resource_snapshot.gpu_utilization_pct
-                episode.cpu_utilization_pct = resource_snapshot.cpu_utilization_pct
             generation_data.add_episode(episode)
             episode_progress.update(1)
             rows_progress.update(generation_data.total_rows_collected - previous_rows)
             elapsed_hours = (time.perf_counter() - generation_started_at) / 3600
             if elapsed_hours > 0:
                 episode_postfix: dict[str, str] = {
-                    "ep/hr": f"{generation_data.total_episodes_run / elapsed_hours:.1f}"
+                    "ep/hr": humanize_number(
+                        generation_data.total_episodes_run / elapsed_hours
+                    )
                 }
                 if episode.average_output_tokens_per_second is not None:
                     episode_postfix["tok/s"] = (
@@ -451,10 +483,10 @@ def run_generation(
                     )
                 if episode.inference_duty_cycle is not None:
                     episode_postfix["duty"] = f"{episode.inference_duty_cycle:.0%}"
-                if episode.gpu_utilization_pct is not None:
-                    episode_postfix["gpu"] = f"{episode.gpu_utilization_pct:.0f}%"
-                if episode.cpu_utilization_pct is not None:
-                    episode_postfix["cpu"] = f"{episode.cpu_utilization_pct:.0f}%"
+                if episode.peak_gpu_utilization_pct is not None:
+                    episode_postfix["gpu"] = f"{episode.peak_gpu_utilization_pct:.0f}%"
+                if episode.peak_cpu_utilization_pct is not None:
+                    episode_postfix["cpu"] = f"{episode.peak_cpu_utilization_pct:.0f}%"
                 episode_progress.set_postfix(episode_postfix)
                 rows_progress.set_postfix(
                     {
@@ -576,9 +608,6 @@ def main() -> Path:
         config.generation.target_successful_rows = args.target_rows
 
     run_id = generate_readable_run_id()
-
-    from src.backend import resolve_backend_context
-    from src.observability import MetricsCollector, MetricsGenner
 
     metrics_collector = MetricsCollector.from_config(config, run_id)
 

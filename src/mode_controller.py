@@ -92,7 +92,7 @@ class ModeController:
     def __init__(self, genner: Genner, config: AppConfig):
         self.genner = genner
         self.config = config
-        self.metrics_collector = getattr(genner, "collector", None)
+        self.metrics_collector = genner.collector
         self.docker_client: Optional[DockerClient] = None
         self.execution_container: Optional[DockerContainer] = None
         self.code_host_cache_folder: Optional[Path] = None
@@ -101,13 +101,8 @@ class ModeController:
         episode_config = config.episode or config.EpisodeConfig()
         self.budget = ActionBudget(total_budget=episode_config.action_budget)
 
-        # Convert storage path to Path object if it's a string
         storage_path = episode_config.scratchpad_storage_path
-        storage_path_obj: Optional[Path] = None
-        if isinstance(storage_path, Path):
-            storage_path_obj = storage_path
-        elif isinstance(storage_path, str) and storage_path:
-            storage_path_obj = Path(storage_path)
+        storage_path_obj = Path(storage_path) if storage_path else None
 
         self.scratchpad = CrossEpisodeScratchpad(
             max_chars=episode_config.scratchpad_max_chars,
@@ -529,6 +524,7 @@ class ModeController:
 
                 # Update episode state with space freed
                 if space_freed > 0:
+                    assert self.episode_state is not None
                     self.episode_state.total_space_freed += space_freed
 
                 # Auto-capture key results in scratchpad (hybrid strategy)
@@ -638,6 +634,7 @@ class ModeController:
 
     def get_episode_summary(self) -> Dict[str, Any]:
         """Get complete episode summary for training data."""
+        assert self.episode_state is not None
         return {
             "episode_id": self.episode_state.episode_id,
             "total_steps": self.episode_state.current_step - 1,

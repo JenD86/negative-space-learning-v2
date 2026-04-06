@@ -193,8 +193,10 @@ class TrajectoryTypeTests(unittest.TestCase):
             inference_call_count=4,
             average_output_tokens_per_second=123.4,
             inference_duty_cycle=0.64,
-            gpu_utilization_pct=87.0,
-            cpu_utilization_pct=42.0,
+            peak_gpu_utilization_pct=87.0,
+            peak_cpu_utilization_pct=42.0,
+            avg_gpu_utilization_pct=72.0,
+            avg_cpu_utilization_pct=35.0,
         )
 
         payload = episode.to_dict()
@@ -206,10 +208,13 @@ class TrajectoryTypeTests(unittest.TestCase):
         self.assertEqual(payload["inference_call_count"], 4)
         self.assertEqual(payload["average_output_tokens_per_second"], 123.4)
         self.assertEqual(payload["inference_duty_cycle"], 0.64)
-        self.assertEqual(payload["gpu_utilization_pct"], 87.0)
-        self.assertEqual(payload["cpu_utilization_pct"], 42.0)
+        self.assertEqual(payload["peak_gpu_utilization_pct"], 87.0)
+        self.assertEqual(payload["peak_cpu_utilization_pct"], 42.0)
+        self.assertEqual(payload["avg_gpu_utilization_pct"], 72.0)
+        self.assertEqual(payload["avg_cpu_utilization_pct"], 35.0)
         self.assertEqual(restored.average_output_tokens_per_second, 123.4)
-        self.assertEqual(restored.gpu_utilization_pct, 87.0)
+        self.assertEqual(restored.peak_gpu_utilization_pct, 87.0)
+        self.assertEqual(restored.avg_gpu_utilization_pct, 72.0)
 
     def test_generation_metadata_includes_throughput_and_utilization_summary(
         self,
@@ -226,8 +231,10 @@ class TrajectoryTypeTests(unittest.TestCase):
                 success=True,
                 average_output_tokens_per_second=100.0,
                 inference_duty_cycle=0.5,
-                gpu_utilization_pct=70.0,
-                cpu_utilization_pct=30.0,
+                peak_gpu_utilization_pct=70.0,
+                peak_cpu_utilization_pct=30.0,
+                avg_gpu_utilization_pct=55.0,
+                avg_cpu_utilization_pct=22.0,
                 container_overhead_seconds=2.0,
                 episode_execution_seconds=8.0,
                 total_inference_ms=5000.0,
@@ -240,8 +247,10 @@ class TrajectoryTypeTests(unittest.TestCase):
                 success=True,
                 average_output_tokens_per_second=200.0,
                 inference_duty_cycle=0.75,
-                gpu_utilization_pct=90.0,
-                cpu_utilization_pct=45.0,
+                peak_gpu_utilization_pct=90.0,
+                peak_cpu_utilization_pct=45.0,
+                avg_gpu_utilization_pct=75.0,
+                avg_cpu_utilization_pct=38.0,
                 container_overhead_seconds=1.0,
                 episode_execution_seconds=9.0,
                 total_inference_ms=7500.0,
@@ -254,10 +263,38 @@ class TrajectoryTypeTests(unittest.TestCase):
         self.assertEqual(metadata["successful_rows_per_hour"], 6.0)
         self.assertEqual(metadata["average_output_tokens_per_second"], 150.0)
         self.assertEqual(metadata["average_inference_duty_cycle"], 0.625)
-        self.assertEqual(metadata["average_gpu_utilization_pct"], 80.0)
-        self.assertEqual(metadata["average_cpu_utilization_pct"], 37.5)
+        self.assertEqual(metadata["peak_gpu_utilization_pct"], 90.0)
+        self.assertEqual(metadata["peak_cpu_utilization_pct"], 45.0)
+        self.assertEqual(metadata["average_gpu_utilization_pct"], 65.0)
+        self.assertEqual(metadata["average_cpu_utilization_pct"], 30.0)
         self.assertEqual(metadata["total_container_overhead_seconds"], 3.0)
         self.assertEqual(metadata["total_inference_seconds"], 12.5)
+
+    def test_episode_trajectory_from_dict_accepts_legacy_utilization_fields(
+        self,
+    ) -> None:
+        restored = EpisodeTrajectory.from_dict(
+            {
+                "episode_id": "ep-legacy",
+                "generation_id": 7,
+                "episode_index": 3,
+                "prompt_responses": [],
+                "trajectory": {},
+                "space_freed_kb": 0.0,
+                "episode_runtime_success": False,
+                "success": False,
+                "action_count": 0,
+                "container_variation": "variation_1_heavy",
+                "started_at": "2026-04-06T00:00:00",
+                "completed_at": "2026-04-06T00:00:01",
+                "duration_seconds": 1.0,
+                "gpu_utilization_pct": 88.0,
+                "cpu_utilization_pct": 41.0,
+            }
+        )
+
+        self.assertEqual(restored.peak_gpu_utilization_pct, 88.0)
+        self.assertEqual(restored.peak_cpu_utilization_pct, 41.0)
 
 
 if __name__ == "__main__":

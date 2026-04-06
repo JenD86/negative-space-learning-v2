@@ -41,8 +41,10 @@ class EpisodeTrajectory:
     inference_call_count: Optional[int] = None
     average_output_tokens_per_second: Optional[float] = None
     inference_duty_cycle: Optional[float] = None
-    gpu_utilization_pct: Optional[float] = None
-    cpu_utilization_pct: Optional[float] = None
+    peak_gpu_utilization_pct: Optional[float] = None
+    peak_cpu_utilization_pct: Optional[float] = None
+    avg_gpu_utilization_pct: Optional[float] = None
+    avg_cpu_utilization_pct: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -83,8 +85,22 @@ class EpisodeTrajectory:
                 payload.get("average_output_tokens_per_second")
             ),
             inference_duty_cycle=_optional_float(payload.get("inference_duty_cycle")),
-            gpu_utilization_pct=_optional_float(payload.get("gpu_utilization_pct")),
-            cpu_utilization_pct=_optional_float(payload.get("cpu_utilization_pct")),
+            peak_gpu_utilization_pct=_optional_float(
+                payload.get(
+                    "peak_gpu_utilization_pct", payload.get("gpu_utilization_pct")
+                )
+            ),
+            peak_cpu_utilization_pct=_optional_float(
+                payload.get(
+                    "peak_cpu_utilization_pct", payload.get("cpu_utilization_pct")
+                )
+            ),
+            avg_gpu_utilization_pct=_optional_float(
+                payload.get("avg_gpu_utilization_pct")
+            ),
+            avg_cpu_utilization_pct=_optional_float(
+                payload.get("avg_cpu_utilization_pct")
+            ),
         )
 
 
@@ -177,25 +193,41 @@ class GenerationData:
                 episodes_with_duty_cycle
             ) / len(episodes_with_duty_cycle)
 
-        episodes_with_gpu_utilization = [
-            episode.gpu_utilization_pct
+        episode_peak_gpu = [
+            episode.peak_gpu_utilization_pct
             for episode in self.all_episodes
-            if episode.gpu_utilization_pct is not None
+            if episode.peak_gpu_utilization_pct is not None
         ]
-        if episodes_with_gpu_utilization:
-            payload["average_gpu_utilization_pct"] = sum(
-                episodes_with_gpu_utilization
-            ) / len(episodes_with_gpu_utilization)
+        if episode_peak_gpu:
+            payload["peak_gpu_utilization_pct"] = max(episode_peak_gpu)
 
-        episodes_with_cpu_utilization = [
-            episode.cpu_utilization_pct
+        episode_peak_cpu = [
+            episode.peak_cpu_utilization_pct
             for episode in self.all_episodes
-            if episode.cpu_utilization_pct is not None
+            if episode.peak_cpu_utilization_pct is not None
         ]
-        if episodes_with_cpu_utilization:
-            payload["average_cpu_utilization_pct"] = sum(
-                episodes_with_cpu_utilization
-            ) / len(episodes_with_cpu_utilization)
+        if episode_peak_cpu:
+            payload["peak_cpu_utilization_pct"] = max(episode_peak_cpu)
+
+        episode_avg_gpu = [
+            episode.avg_gpu_utilization_pct
+            for episode in self.all_episodes
+            if episode.avg_gpu_utilization_pct is not None
+        ]
+        if episode_avg_gpu:
+            payload["average_gpu_utilization_pct"] = sum(episode_avg_gpu) / len(
+                episode_avg_gpu
+            )
+
+        episode_avg_cpu = [
+            episode.avg_cpu_utilization_pct
+            for episode in self.all_episodes
+            if episode.avg_cpu_utilization_pct is not None
+        ]
+        if episode_avg_cpu:
+            payload["average_cpu_utilization_pct"] = sum(episode_avg_cpu) / len(
+                episode_avg_cpu
+            )
 
         container_overheads = [
             episode.container_overhead_seconds

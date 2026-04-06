@@ -46,8 +46,12 @@ class MetricsCollectorTests(unittest.TestCase):
                 return cpu_readings[idx]
 
             with (
-                patch.object(collector, "_read_gpu_utilization_pct", side_effect=gpu_read),
-                patch.object(collector, "_read_cpu_utilization_pct", side_effect=cpu_read),
+                patch.object(
+                    collector, "_read_gpu_utilization_pct", side_effect=gpu_read
+                ),
+                patch.object(
+                    collector, "_read_cpu_utilization_pct", side_effect=cpu_read
+                ),
             ):
                 collector.start_utilization_sampling(interval_seconds=0.05)
                 time.sleep(0.25)
@@ -61,6 +65,23 @@ class MetricsCollectorTests(unittest.TestCase):
         self.assertGreater(summary.sample_count, 0)
         self.assertEqual(summary.peak_gpu_utilization_pct, 80.0)
         self.assertEqual(summary.peak_cpu_utilization_pct, 30.0)
+
+    def test_start_sampling_captures_immediate_sample_for_short_episode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            collector = MetricsCollector(run_id="run-123", output_dir=Path(temp_dir))
+
+            with (
+                patch.object(collector, "_read_gpu_utilization_pct", return_value=34.0),
+                patch.object(collector, "_read_cpu_utilization_pct", return_value=15.0),
+            ):
+                collector.start_utilization_sampling(interval_seconds=1.0)
+                summary = collector.stop_utilization_sampling()
+
+        self.assertEqual(summary.sample_count, 1)
+        self.assertEqual(summary.peak_gpu_utilization_pct, 34.0)
+        self.assertEqual(summary.peak_cpu_utilization_pct, 15.0)
+        self.assertEqual(summary.avg_gpu_utilization_pct, 34.0)
+        self.assertEqual(summary.avg_cpu_utilization_pct, 15.0)
 
     def test_stop_utilization_sampling_without_start_returns_empty(self) -> None:
         with TemporaryDirectory() as temp_dir:

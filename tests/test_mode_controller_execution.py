@@ -36,7 +36,8 @@ class ModeControllerExecutionTests(unittest.TestCase):
         write_code_in_con.return_value = ("/tmp/script.py", "print('hello')")
         run_code_in_con.return_value = Ok("hello")
 
-        mode_controller = ModeController(MagicMock(), make_app_config())
+        genner = MagicMock(collector=None)
+        mode_controller = ModeController(genner, make_app_config())
 
         docker_client = MagicMock()
         container = MagicMock()
@@ -60,7 +61,8 @@ class ModeControllerExecutionTests(unittest.TestCase):
         )
 
     def test_execute_python_code_fails_without_docker_context(self) -> None:
-        mode_controller = ModeController(MagicMock(), make_app_config())
+        genner = MagicMock(collector=None)
+        mode_controller = ModeController(genner, make_app_config())
 
         result = mode_controller.execute_python_code("print('hello')")
 
