@@ -11,6 +11,7 @@ from scripts.generate_training_data import (
     save_generation_data,
     select_variation_index,
 )
+from src.container import ContainerBrokenError
 from src.typing.config import AppConfig
 from src.typing.trajectory import EpisodeTrajectory, GenerationData
 
@@ -174,6 +175,11 @@ class GenerationOrchestratorTests(unittest.TestCase):
 
     def configure_manager_mock(self, manager: MagicMock) -> None:
         manager.get_mixed_cleanup_variations.return_value = [{}, {}, {}, {}, {}]
+        manager.populate.return_value = (
+            [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+            {"container-a": 0.0, "container-b": 0.0},
+        )
+        manager.rebuild_containers.return_value = None
 
     def test_run_generation_stops_at_target_rows(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -424,7 +430,11 @@ class GenerationOrchestratorTests(unittest.TestCase):
             config = self.make_config(base_dir)
             manager = MagicMock()
             manager.populate.return_value = (
-                [MagicMock(variation_name="variation_4_large_sparse", expected_kb=19400)],
+                [
+                    MagicMock(
+                        variation_name="variation_4_large_sparse", expected_kb=19400
+                    )
+                ],
                 {"container-a": 0.0},
             )
             manager.verify_population.return_value = {"success": True}
@@ -1056,7 +1066,6 @@ class GenerationOrchestratorTests(unittest.TestCase):
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["episode_id"] for row in sft_rows}, {"ep-0"})
 
-
     def test_circuit_breaker_breaks_on_consecutive_verification_failures(self) -> None:
         with TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
@@ -1122,33 +1131,54 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 # 2 failures, then a success, then 2 more failures — should NOT trip
                 run_single_episode_mock.side_effect = [
                     self.make_episode(
-                        0, row_count=0, success=False, space_freed_kb=0.0,
+                        0,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(
-                        1, row_count=0, success=False, space_freed_kb=0.0,
+                        1,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(2, row_count=1, success=True),
                     self.make_episode(
-                        3, row_count=0, success=False, space_freed_kb=0.0,
+                        3,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(
-                        4, row_count=0, success=False, space_freed_kb=0.0,
+                        4,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(5, row_count=1, success=True),
                     self.make_episode(
-                        6, row_count=0, success=False, space_freed_kb=0.0,
+                        6,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(
-                        7, row_count=0, success=False, space_freed_kb=0.0,
+                        7,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(
-                        8, row_count=0, success=False, space_freed_kb=0.0,
+                        8,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
                         error_message="container population verification failed",
                     ),
                     self.make_episode(9, row_count=1, success=True),
@@ -1164,6 +1194,209 @@ class GenerationOrchestratorTests(unittest.TestCase):
 
         # Trips at episode 8 (3 consecutive failures: 6, 7, 8)
         self.assertEqual(run_single_episode_mock.call_count, 9)
+
+    def test_run_generation_recovers_from_broken_container_without_recording_it(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir, max_episodes=1)
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                populated = (
+                    [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                    {"container-a": 0.0, "container-b": 0.0},
+                )
+                manager.populate.side_effect = [
+                    ContainerBrokenError(
+                        "baseline measurement failed", ["container-b"]
+                    ),
+                    populated,
+                ]
+                run_single_episode_mock.return_value = self.make_episode(
+                    0, row_count=1, success=True
+                )
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        manager.rebuild_containers.assert_called_once_with(["container-b"])
+        self.assertEqual(manager.populate.call_count, 2)
+        self.assertEqual(run_single_episode_mock.call_count, 1)
+        self.assertEqual(run_single_episode_mock.call_args.kwargs["episode_index"], 0)
+        self.assertEqual(
+            run_single_episode_mock.call_args.kwargs["population_results"], populated[0]
+        )
+        self.assertEqual(
+            run_single_episode_mock.call_args.kwargs["baseline_kb"], populated[1]
+        )
+        self.assertEqual(generation_data.total_episodes_run, 1)
+
+    def test_run_generation_aborts_after_three_consecutive_rebuild_failures(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir, max_episodes=5)
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                manager.populate.side_effect = [
+                    ContainerBrokenError(
+                        "baseline measurement failed", ["container-a"]
+                    ),
+                    ContainerBrokenError(
+                        "baseline measurement failed", ["container-a"]
+                    ),
+                    ContainerBrokenError(
+                        "baseline measurement failed", ["container-a"]
+                    ),
+                ]
+                manager.rebuild_containers.side_effect = [
+                    RuntimeError("first rebuild failed"),
+                    RuntimeError("second rebuild failed"),
+                    RuntimeError("third rebuild failed"),
+                ]
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        self.assertEqual(manager.rebuild_containers.call_count, 3)
+        self.assertEqual(run_single_episode_mock.call_count, 0)
+        self.assertEqual(generation_data.total_episodes_run, 0)
+
+    def test_run_generation_reuses_variation_after_recovery_retry(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                max_episodes=1,
+                variation_strategy="random",
+                variation_random_seed=7,
+            )
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+                patch(
+                    "scripts.generate_training_data.select_variation_index",
+                    side_effect=[4, 1],
+                ) as select_variation_index_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                manager.populate.side_effect = [
+                    ContainerBrokenError(
+                        "baseline measurement failed", ["container-b"]
+                    ),
+                    manager.populate.return_value,
+                ]
+                run_single_episode_mock.return_value = self.make_episode(
+                    0, row_count=1, success=True
+                )
+
+                run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        self.assertEqual(select_variation_index_mock.call_count, 1)
+        self.assertEqual(run_single_episode_mock.call_args.kwargs["variation_index"], 4)
+
+    def test_scheduled_restart_resets_verification_failure_counter(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_successful_rows=100,
+                max_episodes=4,
+                container_restart_interval=2,
+                container_rebuild_interval=99,
+                max_consecutive_verification_failures=3,
+            )
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.side_effect = [
+                    self.make_episode(
+                        0,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        1,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        2,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        3,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                ]
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        self.assertEqual(run_single_episode_mock.call_count, 4)
+        self.assertEqual(manager.restart.call_count, 1)
+        self.assertEqual(generation_data.total_episodes_run, 4)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,14 @@ class ContainerPopulationResult:
     expected_kb: int
     success: bool
     error_message: Optional[str] = None
+
+
+class ContainerBrokenError(Exception):
+    """Raised when baseline measurement fails for one or more containers."""
+
+    def __init__(self, message: str, broken_ids: List[str]) -> None:
+        super().__init__(message)
+        self.broken_ids = list(broken_ids)
 
 
 class ContainerManager:
@@ -77,6 +86,21 @@ class ContainerManager:
 
         # Phase 2: measure baseline after cleanup
         baseline_kb = self._measure_population_kb()
+        broken_ids = [
+            container_id
+            for container_id, measured_kb in baseline_kb.items()
+            if measured_kb is None
+        ]
+        if broken_ids:
+            raise ContainerBrokenError(
+                f"Container baseline measurement failed for: {broken_ids}",
+                broken_ids,
+            )
+        effective_baseline_kb = {
+            container_id: float(measured_kb)
+            for container_id, measured_kb in baseline_kb.items()
+            if measured_kb is not None
+        }
 
         # Phase 3: create variation files
         for container_id in self.container_ids:
@@ -108,14 +132,17 @@ class ContainerManager:
                         error_message=str(exc),
                     )
                 )
-        return results, baseline_kb
+        return results, effective_baseline_kb
 
-    def _measure_population_kb(self) -> Dict[str, float]:
+    def _measure_population_kb(self) -> Dict[str, Optional[float]]:
         command = """
+        set -euo pipefail
+        command -v du >/dev/null 2>&1 || exit 127
+        command -v awk >/dev/null 2>&1 || exit 127
         total=0
         for dir in /tmp /var/log /var/cache /var/tmp /home/alice; do
             if [ -d \"$dir\" ]; then
-                size=$(du -sk \"$dir\" 2>/dev/null | awk '{print $1}')
+                size=$(du -sk \"$dir\" | awk '{print $1}')
                 if [ -n \"$size\" ]; then
                     total=$((total + size))
                 fi
@@ -123,23 +150,35 @@ class ContainerManager:
         done
         echo $total
         """
-        measurements: Dict[str, float] = {}
+        measurements: Dict[str, Optional[float]] = {}
         for container_id in self.container_ids:
             container = self.docker_client.containers.get(container_id)
             exec_result = container.exec_run(["sh", "-c", command])
             exit_code, output = self._coerce_exec_result(exec_result)
             if exit_code != 0:
-                measurements[container_id] = 0.0
+                logger.error(
+                    f"Container {container_id} population measurement failed: "
+                    f"exit_code={exit_code}, "
+                    f"output={output.decode('utf-8', errors='replace')[:200]}"
+                )
+                measurements[container_id] = None
                 continue
             output_text = output.decode("utf-8", errors="replace").strip()
-            measurements[container_id] = float(output_text) if output_text else 0.0
+            try:
+                measurements[container_id] = float(output_text) if output_text else 0.0
+            except ValueError:
+                logger.error(
+                    f"Container {container_id} population measurement returned "
+                    f"non-numeric output: {output_text[:200]}"
+                )
+                measurements[container_id] = None
         return measurements
 
     def verify_population(
         self,
         expected_kb: int,
         tolerance: float,
-        baseline_kb: Optional[Dict[str, float]] = None,
+        baseline_kb: Optional[Mapping[str, Optional[float]]] = None,
     ) -> Dict[str, Any]:
         lower_bound_kb = expected_kb * (1.0 - tolerance)
         upper_bound_kb = expected_kb * (1.0 + tolerance)
@@ -149,15 +188,27 @@ class ContainerManager:
 
         for container_id, measured_kb in self._measure_population_kb().items():
             container_baseline = effective_baseline.get(container_id, 0.0)
-            delta_kb = measured_kb - container_baseline
-            within_tolerance = lower_bound_kb <= delta_kb <= upper_bound_kb
+            measurement_failed = measured_kb is None or container_baseline is None
+            delta_kb: Optional[float] = None
+            within_tolerance = False
+            if not measurement_failed:
+                assert measured_kb is not None
+                assert container_baseline is not None
+                delta_kb = measured_kb - container_baseline
+                within_tolerance = lower_bound_kb <= delta_kb <= upper_bound_kb
             containers[container_id] = {
                 "measured_kb": measured_kb,
                 "baseline_kb": container_baseline,
                 "delta_kb": delta_kb,
                 "within_tolerance": within_tolerance,
+                "measurement_failed": measurement_failed,
             }
-            if not within_tolerance:
+            if measurement_failed:
+                logger.error(
+                    f"Container {container_id} population verification failed: "
+                    "measurement command failed"
+                )
+            elif not within_tolerance:
                 logger.warning(
                     f"Container {container_id} population verification failed: "
                     f"delta={delta_kb:.1f}KB (measured={measured_kb:.1f}KB - "
@@ -185,6 +236,46 @@ class ContainerManager:
         if not self.verify_ready():
             raise RuntimeError("Containers failed readiness check after rebuild")
 
+    def rebuild_containers(self, broken_ids: List[str]) -> None:
+        self._require_compose_dir()
+        if not broken_ids:
+            return
+        requested_ids = list(dict.fromkeys(broken_ids))
+        if set(requested_ids) == set(self.container_ids):
+            self.rebuild()
+            return
+
+        target_services: List[str] = []
+        for container_id in requested_ids:
+            service_name = self._container_to_service(container_id)
+            if service_name not in target_services:
+                target_services.append(service_name)
+            self._run_compose(
+                [
+                    "docker",
+                    "compose",
+                    "up",
+                    "-d",
+                    "--build",
+                    "--force-recreate",
+                    "--no-deps",
+                    service_name,
+                ]
+            )
+
+        refreshed_container_ids = self.refresh_container_ids()
+        rebuilt_container_ids = [
+            container_id
+            for container_id in refreshed_container_ids
+            if self._container_to_service(container_id) in target_services
+        ]
+        self._install_procps_for(rebuilt_container_ids)
+        for container_id in rebuilt_container_ids:
+            if not self.verify_container_ready(container_id):
+                raise RuntimeError(
+                    f"Container {container_id} failed readiness check after rebuild"
+                )
+
     def restart(self) -> None:
         self._require_compose_dir()
         self._run_compose(["docker", "compose", "down"])
@@ -196,7 +287,11 @@ class ContainerManager:
 
     def verify_ready(self) -> bool:
         for container_id in self.container_ids:
-            wait_and_get_container(self.docker_client, container_id)
+            self.verify_container_ready(container_id)
+        return True
+
+    def verify_container_ready(self, container_id: str, timeout: int = 30) -> bool:
+        wait_and_get_container(self.docker_client, container_id, timeout=timeout)
         return True
 
     def measure_free_space(self) -> Dict[str, float]:
@@ -210,13 +305,30 @@ class ContainerManager:
         return measurements
 
     def _install_procps(self) -> None:
-        for container_id in self.container_ids:
+        self._install_procps_for(self.container_ids)
+
+    def _install_procps_for(self, container_ids: List[str]) -> None:
+        for container_id in container_ids:
             container = self.docker_client.containers.get(container_id)
             container.exec_run(
                 ["sh", "-c", "apk add --no-cache procps"],
                 stdout=False,
                 stderr=False,
             )
+
+    def _container_to_service(self, container_id: str) -> str:
+        container_name = container_id
+        try:
+            container = self.docker_client.containers.get(container_id)
+        except Exception:
+            container = None
+        if container is not None and container.name:
+            container_name = container.name
+
+        parts = container_name.split("_")
+        if len(parts) >= 3:
+            return parts[-2]
+        raise ValueError(f"Cannot parse service from container name: {container_name}")
 
     def _run_compose(self, command: List[str]) -> None:
         subprocess.run(

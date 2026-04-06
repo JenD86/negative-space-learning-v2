@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-from src.container import ContainerManager
+from src.container import ContainerBrokenError, ContainerManager
 
 
 class ExecResult:
@@ -79,6 +79,38 @@ class ContainerManagerTests(unittest.TestCase):
 
         self.assertEqual(baseline, {"container-a": 50000.0, "container-b": 51000.0})
 
+    def test_measure_population_kb_returns_none_on_exec_failure(self) -> None:
+        manager, _, container_a, _ = self.make_manager(exec_return=b"321")
+        container_a.exec_run.return_value = ExecResult(127, b"exec: du: not found")
+
+        measurements = manager._measure_population_kb()
+
+        self.assertIsNone(measurements["container-a"])
+        self.assertEqual(measurements["container-b"], 321.0)
+
+    def test_measure_population_kb_uses_hardened_script_guards(self) -> None:
+        manager, _, container_a, _ = self.make_manager(exec_return=b"321")
+
+        manager._measure_population_kb()
+
+        command = container_a.exec_run.call_args.args[0][2]
+        self.assertIn("set -euo pipefail", command)
+        self.assertIn("command -v du >/dev/null 2>&1 || exit 127", command)
+        self.assertIn("command -v awk >/dev/null 2>&1 || exit 127", command)
+
+    def test_populate_raises_container_broken_error_on_failed_baseline(self) -> None:
+        manager, _, _, _ = self.make_manager()
+
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": None, "container-b": 100.0},
+        ):
+            with self.assertRaises(ContainerBrokenError) as exc_info:
+                manager.populate(0)
+
+        self.assertEqual(exc_info.exception.broken_ids, ["container-a"])
+
     def test_verify_population_delta_outside_tolerance_fails(self) -> None:
         """Delta (measured - baseline) is too small relative to expected_kb."""
         manager, _, _, _ = self.make_manager()
@@ -116,9 +148,7 @@ class ContainerManagerTests(unittest.TestCase):
         self.assertTrue(report["success"])
         self.assertTrue(report["containers"]["container-a"]["within_tolerance"])
         self.assertTrue(report["containers"]["container-b"]["within_tolerance"])
-        self.assertAlmostEqual(
-            report["containers"]["container-a"]["delta_kb"], 15500.0
-        )
+        self.assertAlmostEqual(report["containers"]["container-a"]["delta_kb"], 15500.0)
         self.assertAlmostEqual(
             report["containers"]["container-a"]["baseline_kb"], 50000.0
         )
@@ -139,6 +169,24 @@ class ContainerManagerTests(unittest.TestCase):
         self.assertFalse(report["success"])
         self.assertTrue(report["containers"]["container-a"]["within_tolerance"])
         self.assertFalse(report["containers"]["container-b"]["within_tolerance"])
+
+    def test_verify_population_handles_none_measurements(self) -> None:
+        manager, _, _, _ = self.make_manager()
+        baseline_kb = {"container-a": 0.0, "container-b": 0.0}
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": None, "container-b": 15500.0},
+        ):
+            report = manager.verify_population(
+                expected_kb=15500, tolerance=0.2, baseline_kb=baseline_kb
+            )
+
+        self.assertFalse(report["success"])
+        self.assertTrue(report["containers"]["container-a"]["measurement_failed"])
+        self.assertIsNone(report["containers"]["container-a"]["delta_kb"])
+        self.assertFalse(report["containers"]["container-a"]["within_tolerance"])
+        self.assertFalse(report["containers"]["container-b"]["measurement_failed"])
 
     @patch("src.container.subprocess.run")
     def test_rebuild_calls_compose_with_build_flag(
@@ -234,6 +282,64 @@ class ContainerManagerTests(unittest.TestCase):
         )
         self.assertEqual(manager.container_ids, refreshed)
 
+    def test_container_to_service_parses_name_from_container_lookup(self) -> None:
+        manager, _, _, _ = self.make_manager()
+
+        self.assertEqual(manager._container_to_service("container-a"), "service-a")
+        self.assertEqual(
+            manager._container_to_service("special-learn-compose_service-b_1"),
+            "service-b",
+        )
+
+    def test_rebuild_containers_targets_specific_services(self) -> None:
+        manager, _, _, _ = self.make_manager()
+
+        with (
+            patch.object(manager, "_run_compose") as mock_compose,
+            patch.object(
+                manager,
+                "refresh_container_ids",
+                return_value=[
+                    "special-learn-compose_service-a_1",
+                    "special-learn-compose_service-b_1",
+                ],
+            ),
+            patch.object(manager, "_install_procps_for") as install_procps,
+            patch.object(
+                manager, "verify_container_ready", return_value=True
+            ) as verify,
+        ):
+            manager.rebuild_containers(["container-b"])
+
+        mock_compose.assert_called_once_with(
+            [
+                "docker",
+                "compose",
+                "up",
+                "-d",
+                "--build",
+                "--force-recreate",
+                "--no-deps",
+                "service-b",
+            ]
+        )
+        install_procps.assert_called_once_with(["special-learn-compose_service-b_1"])
+        verify.assert_called_once_with("special-learn-compose_service-b_1")
+
+    def test_rebuild_containers_falls_back_to_stack_rebuild_when_all_broken(
+        self,
+    ) -> None:
+        manager, _, _, _ = self.make_manager()
+
+        with (
+            patch.object(manager, "rebuild") as rebuild,
+            patch.object(manager, "_run_compose") as mock_compose,
+        ):
+            manager.rebuild_containers(["container-a", "container-b"])
+
+        rebuild.assert_called_once_with()
+        mock_compose.assert_not_called()
+
     @patch("src.container.subprocess.run")
     def test_rebuild_installs_procps_for_readiness_probe(
         self,
@@ -314,11 +420,24 @@ class ContainerManagerTests(unittest.TestCase):
         self.assertTrue(ready)
         wait_and_get_container.assert_has_calls(
             [
-                call(manager.docker_client, "container-a"),
-                call(manager.docker_client, "container-b"),
+                call(manager.docker_client, "container-a", timeout=30),
+                call(manager.docker_client, "container-b", timeout=30),
             ]
         )
 
+    @patch("src.container.wait_and_get_container")
+    def test_verify_container_ready_checks_single_container(
+        self,
+        wait_and_get_container: MagicMock,
+    ) -> None:
+        manager, _, _, _ = self.make_manager()
+
+        ready = manager.verify_container_ready("container-b")
+
+        self.assertTrue(ready)
+        wait_and_get_container.assert_called_once_with(
+            manager.docker_client, "container-b", timeout=30
+        )
 
     def test_cleanup_command_includes_var_tmp_and_dotfiles(self) -> None:
         manager, _, container_a, _ = self.make_manager()

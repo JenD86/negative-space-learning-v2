@@ -17,7 +17,7 @@ from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.container import ContainerManager
+from src.container import ContainerBrokenError, ContainerManager
 from src.helper import generate_readable_run_id, unflatten_toml_dict
 from src.observability.types import UtilizationSummary
 from src.scratchpad import CrossEpisodeScratchpad
@@ -109,6 +109,8 @@ def run_single_episode(
     variation_index,
     run_id,
     metrics_collector=None,
+    population_results=None,
+    baseline_kb=None,
 ) -> EpisodeTrajectory:
     started_at = datetime.now().isoformat()
     generation_config = config.generation or AppConfig.GenerationConfig()
@@ -132,11 +134,14 @@ def run_single_episode(
         utilization_sampling_started = True
 
     container_started_at = time.perf_counter()
-    try:
-        population_results, baseline_kb = container_manager.populate(variation_index)
-    except Exception:
-        _stop_utilization_sampling()
-        raise
+    if population_results is None or baseline_kb is None:
+        try:
+            population_results, baseline_kb = container_manager.populate(
+                variation_index
+            )
+        except Exception:
+            _stop_utilization_sampling()
+            raise
     if not population_results:
         _stop_utilization_sampling()
         raise RuntimeError("container_manager.populate returned no results")
@@ -442,21 +447,59 @@ def run_generation(
     )
     generation_started_at = time.perf_counter()
     consecutive_verification_failures = 0
+    consecutive_rebuild_failures = 0
+    episode_index = start_episode_index
+    pending_variation_index: Optional[int] = None
 
     try:
-        for episode_index in range(start_episode_index, generation_config.max_episodes):
+        while episode_index < generation_config.max_episodes:
             if (
                 generation_data.total_rows_collected
                 >= generation_config.target_successful_rows
             ):
                 break
 
-            variation_index = select_variation_index(
-                generation_config.variation_strategy,
-                episode_index,
-                variation_count,
-                rng=rng,
-            )
+            if pending_variation_index is None:
+                variation_index = select_variation_index(
+                    generation_config.variation_strategy,
+                    episode_index,
+                    variation_count,
+                    rng=rng,
+                )
+            else:
+                variation_index = pending_variation_index
+
+            try:
+                population_results, baseline_kb = container_manager.populate(
+                    variation_index
+                )
+            except ContainerBrokenError as exc:
+                pending_variation_index = variation_index
+                logger.info(
+                    f"Episode {episode_index}: rebuilding broken containers "
+                    f"{exc.broken_ids} before retry"
+                )
+                try:
+                    container_manager.rebuild_containers(exc.broken_ids)
+                except Exception as rebuild_exc:
+                    consecutive_rebuild_failures += 1
+                    logger.warning(
+                        f"Episode {episode_index}: container recovery failed "
+                        f"({consecutive_rebuild_failures} consecutive): "
+                        f"{rebuild_exc}"
+                    )
+                    if consecutive_rebuild_failures >= 3:
+                        logger.error(
+                            "Circuit breaker tripped: 3 consecutive container "
+                            "rebuild failures. Aborting generation."
+                        )
+                        break
+                else:
+                    consecutive_rebuild_failures = 0
+                continue
+
+            pending_variation_index = None
+            consecutive_rebuild_failures = 0
             previous_rows = generation_data.total_rows_collected
             episode = run_single_episode(
                 genner=genner,
@@ -468,14 +511,13 @@ def run_generation(
                 variation_index=variation_index,
                 run_id=run_id,
                 metrics_collector=metrics_collector,
+                population_results=population_results,
+                baseline_kb=baseline_kb,
             )
             generation_data.add_episode(episode)
 
             # Circuit breaker: detect systematic verification failures
-            if (
-                episode.error_message
-                == "container population verification failed"
-            ):
+            if episode.error_message == "container population verification failed":
                 consecutive_verification_failures += 1
                 logger.warning(
                     f"Episode {episode_index}: container population verification "
@@ -540,6 +582,8 @@ def run_generation(
                 == 0
             ):
                 container_manager.rebuild()
+                consecutive_verification_failures = 0
+                consecutive_rebuild_failures = 0
             elif (
                 generation_config.container_restart_interval > 0
                 and completed_episodes < generation_config.max_episodes
@@ -547,6 +591,10 @@ def run_generation(
                 == 0
             ):
                 container_manager.restart()
+                consecutive_verification_failures = 0
+                consecutive_rebuild_failures = 0
+
+            episode_index += 1
     finally:
         episode_progress.close()
         rows_progress.close()
