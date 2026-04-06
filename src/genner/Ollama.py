@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 from loguru import logger
 from ollama import ChatResponse, Client, chat
 from result import Err, Ok, Result, UnwrapError, is_err
 
 from src.helper import timeout
+from src.observability.types import InferenceResult, UsageInfo
 from src.typing.message import Message
 
 from .Base import Genner
@@ -23,7 +24,7 @@ class OllamaGenner(Genner):
 
         self.config = config
 
-    def plist_completion(self, messages: List[Message]) -> Result[str, str]:
+    def plist_completion(self, messages: List[Message]) -> Result[InferenceResult, str]:
         try:
             with timeout(300):
                 response: ChatResponse = self.client.chat(self.config.model, messages)
@@ -35,7 +36,12 @@ class OllamaGenner(Genner):
                     f"`messages`: \n{messages}"
                 )
 
-            return Ok(response.message.content)
+            return Ok(
+                InferenceResult(
+                    content=response.message.content,
+                    usage=self.get_usage_info(response),
+                )
+            )
         except TimeoutError as e:
             return Err(
                 "OllamaGenner.plist_completion: Timeout error,\n"  #
@@ -56,7 +62,7 @@ class OllamaGenner(Genner):
     ) -> Result[Tuple[str, str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             extracted_code = self.extract_code(raw_response).unwrap()
 
             return Ok((extracted_code, raw_response))
@@ -105,7 +111,7 @@ class OllamaGenner(Genner):
     ) -> Result[Tuple[List[str], str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             # raw_response here is guaranteed to be a string due to successful unwrap above
             processed_list = self.extract_list(raw_response).unwrap()  # type: ignore
             return Ok((processed_list, raw_response))  # type: ignore
@@ -156,3 +162,28 @@ class OllamaGenner(Genner):
     @staticmethod
     def extract_list(response: str) -> Result[List[str], str]:
         return Ok(response.splitlines())
+
+    @staticmethod
+    def get_usage_info(response: object) -> UsageInfo:
+        response = cast(ChatResponse, response)
+        prompt_tokens = response.prompt_eval_count
+        completion_tokens = response.eval_count
+        total_tokens = None
+        if prompt_tokens is not None or completion_tokens is not None:
+            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+        total_duration = response.total_duration
+        eval_duration = response.eval_duration
+        latency_source = total_duration if total_duration is not None else eval_duration
+        latency_ms = None
+        if latency_source is not None:
+            latency_ms = float(latency_source) / 1_000_000
+
+        return UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+            model=response.model,
+            stop_reason=response.done_reason,
+        )

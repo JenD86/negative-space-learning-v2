@@ -141,3 +141,11 @@ def get_formatted_repo_info():
 
 def string_hash(string: str) -> str:
     return hashlib.sha256(string.encode()).hexdigest()
+
+
+def humanize_number(n):
+    for suffix, divisor in [("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9), ("T", 1e12)]:
+        if abs(n) < divisor * 1e3 or suffix == "T":
+            val = n / divisor
+            return f"{val:.1f}".rstrip("0").rstrip(".") + suffix
+    return str(n)

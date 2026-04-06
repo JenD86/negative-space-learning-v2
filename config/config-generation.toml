@@ -1,0 +1,44 @@
+dev = true
+model_name = "llama:bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF"
+gpu_memory_utilization = 0.85
+code_host_cache_path = "./code/generation/code/"
+container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]
+main_container_idx = 0
+
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"
+
+train_data_save_folder = "./data/generation/train_data"
+
+[inference]
+max_tokens = 4096
+timeout = 300
+
+[episode]
+action_budget = 12
+scratchpad_max_chars = 10000
+scratchpad_storage_path = "./data/generation/scratchpad.json"
+success_threshold_kb = 0.0
+
+[generation]
+target_successful_rows = 500
+max_episodes = 10000
+container_restart_interval = 10
+container_rebuild_interval = 20
+success_threshold_kb = 0.0
+variation_strategy = "round_robin"
+# variation_random_seed = 42
+post_rebuild_wait_seconds = 5
+population_verification_tolerance = 0.2
+checkpoint_every_episode = true
+resume_from_checkpoint = true
+show_progress = true
+resource_snapshot_interval_episodes = 1
+generation_output_dir = "./data/generations"
+reset_scratchpad_between_episodes = true
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true

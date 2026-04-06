@@ -1,12 +1,13 @@
 import io
 import json
+import os
 import shutil
-import subprocess
 import tarfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 from loguru import logger
 from result import Err, Ok, Result
@@ -17,7 +18,13 @@ from docker import DockerClient
 from docker.errors import APIError as DockerAPIErrorException
 from docker.errors import NotFound as DockerNotFoundException
 from docker.models.containers import Container as DockerContainer
-from src.helper import nanoid, timeout
+from src.helper import timeout
+
+
+@dataclass
+class FilesystemGroup:
+    filesystem_id: str
+    container_ids: List[str]
 
 
 def fetch_container(client: DockerClient, container_id: str):
@@ -117,37 +124,29 @@ def write_code_in_con(
 
 
 def run_code_in_con(
-    container: DockerContainer, in_container_script_path: str
+    container: DockerContainer,
+    in_container_script_path: str,
+    timeout_seconds: int = 600,
 ) -> Result[str, str]:
-    """Run code in container and return the exit code, execution output, and reflected code.
-
-    Algorithm:
-    - Write code into a temporary file in the host machine
-    - Create a tar archive containing the file
-    - Copy the tar archive to the container's root directory
-    - Check if the file exists in the container
-    - Run the code in the container
-    - Return the exit code, execution output, and reflected code
+    """Run a Python script path inside a container and return its output.
 
     Args:
-        container (DockerContainer): The container to run the code in
-        temp_file_path (str): The path to the file in container containing the code
+        container: The container to run the code in.
+        in_container_script_path: The in-container path to the Python script.
+        timeout_seconds: Maximum execution time before failure.
 
     Returns:
         Result[str, str]:
-            - Ok: A string containing the execution_output
-            - Err: An error message describing what went wrong
+            - Ok: Combined stdout/stderr output when exit code is 0.
+            - Err: Error details when execution fails or times out.
 
     Note:
-        - The execution has a timeout of 150 seconds
-        - After execution, any remaining Python processes are killed
+        - After execution, any remaining Python processes are killed.
     """
     command_str = f"python -u {in_container_script_path} 2>&1"
     cmd = ["/bin/sh", "-c", command_str]  # Execute via shell
     timeout_bool = False
     timeout_checker = time.time()
-    timeout_seconds = 600
-
     try:
         with timeout(seconds=timeout_seconds):
             python_exit_code, python_output = cast(
@@ -334,16 +333,124 @@ def get_container_free_disk_space_kb_v2(
         raise e
 
 
+def get_container_backing_fs_id(
+    client: DockerClient,
+    container: DockerContainer,
+) -> str:
+    """Get a stable identifier for a container's backing filesystem."""
+    try:
+        container.reload()
+        graph_data = container.attrs.get("GraphDriver", {}).get("Data", {})
+        upper_dir = graph_data.get("UpperDir")
+        if upper_dir:
+            stat_result = os.stat(upper_dir)
+            return (
+                f"device:{os.major(stat_result.st_dev)}:{os.minor(stat_result.st_dev)}"
+            )
+    except Exception as exc:
+        logger.debug(
+            f"Failed to determine device-based filesystem id for {container.id}: {exc}"
+        )
+
+    try:
+        info = client.info()
+        docker_root_dir = info.get("DockerRootDir")
+        storage_driver = info.get("StorageDriver", "unknown")
+        if docker_root_dir:
+            return f"daemon:{storage_driver}:{docker_root_dir}"
+    except Exception as exc:
+        logger.debug(
+            f"Failed to determine daemon-based filesystem id for {container.id}: {exc}"
+        )
+
+    container_id_prefix = container.id[:12] if container.id else "unknown"
+    return f"container:{container_id_prefix}"
+
+
+def group_containers_by_filesystem(
+    client: DockerClient,
+    containers: List[DockerContainer],
+) -> List[FilesystemGroup]:
+    groups: Dict[str, FilesystemGroup] = {}
+
+    for container in containers:
+        if container.id is None:
+            logger.warning(
+                "Skipping container with missing id when grouping filesystems"
+            )
+            continue
+
+        filesystem_id = get_container_backing_fs_id(client, container)
+        if filesystem_id not in groups:
+            groups[filesystem_id] = FilesystemGroup(
+                filesystem_id=filesystem_id,
+                container_ids=[],
+            )
+        groups[filesystem_id].container_ids.append(container.id)
+
+    return list(groups.values())
+
+
+def calculate_deduplicated_space_freed(
+    measurements: Dict[str, Tuple[float, float]],
+    filesystem_groups: List[FilesystemGroup],
+) -> float:
+    """
+    Compute total space delta by counting each backing filesystem once.
+
+    measurements maps container_id -> (before_free_kb, after_free_kb).
+    """
+    total_space_freed_kb = 0.0
+
+    for group in filesystem_groups:
+        group_measurements = [
+            measurements[container_id]
+            for container_id in group.container_ids
+            if container_id in measurements
+        ]
+        if not group_measurements:
+            continue
+
+        avg_before_kb = sum(before for before, _ in group_measurements) / len(
+            group_measurements
+        )
+        avg_after_kb = sum(after for _, after in group_measurements) / len(
+            group_measurements
+        )
+
+        total_space_freed_kb += avg_after_kb - avg_before_kb
+
+    return total_space_freed_kb
+
+
 def wait_and_get_container(
     client: DockerClient, container_name: str, timeout: int = 30
 ) -> DockerContainer:
     """Wait for container to be fully running and return the container object."""
     start_time = time.time()
+    terminal_states = {"exited", "dead"}
 
     while time.time() - start_time < timeout:
         try:
             container = client.containers.get(container_name)
             container.reload()
+
+            if container.status in terminal_states:
+                logs = ""
+                try:
+                    logs_output = container.logs(tail=20)
+                    logs = (
+                        logs_output.decode("utf-8", errors="replace")
+                        if isinstance(logs_output, bytes)
+                        else str(logs_output)
+                    ).strip()
+                except Exception:
+                    logs = "<unavailable>"
+
+                detail = f" Last logs:\n{logs}" if logs else ""
+                raise RuntimeError(
+                    f"Container {container_name} is in terminal state '{container.status}'.{detail}"
+                )
 
             if container.status == "running":
                 # Test if container is truly ready by running a simple command

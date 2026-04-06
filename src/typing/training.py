@@ -178,3 +178,38 @@ def save_train_data(
 
         with open(file_path, "w") as f:
             json.dump(train_data_item, f, indent=4)
+
+
+def save_generation_training_data(
+    rows: List[Dict[str, Any]],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, default=str) + "\n")
+
+
+def append_episode_jsonl(
+    episode: Dict[str, Any],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(episode, default=str) + "\n")
+
+
+def save_generation_checkpoint(
+    checkpoint: Dict[str, Any],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(checkpoint, handle, indent=2, default=str)
+
+
+def load_generation_checkpoint(output_path: Path) -> Dict[str, Any] | None:
+    if not output_path.exists():
+        return None
+    with open(output_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)

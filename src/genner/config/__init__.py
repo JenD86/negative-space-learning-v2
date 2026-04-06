@@ -10,18 +10,22 @@ class OllamaConfig(ABC, BaseModel):
     model: str
     stream: bool
 
+
 class QwenConfig(OllamaConfig):
     name: str = "Ollama Qwen"
     model: str = "qwen-cleanup-merged:latest"
     _model_uncensored: str = "qwen-uncensored:latest"
     stream: bool = False
 
+
 class QwenPeftConfig(BaseModel):
     """Configuration for PEFT-based Qwen model."""
+
     name: str = "Qwen PEFT"
     base_model_path: str = "Qwen/Qwen2.5-7B-Instruct"
     checkpoint_path: str
     device: str = "auto"
+
 
 class DreamConfig(NamedTuple):
     """Configuration for the Dream API generator."""
@@ -42,10 +46,12 @@ class DreamConfig(NamedTuple):
     alg: str = "origin"
     alg_temp: float = 0.3
 
+
 @dataclass
-class VllmConfig:
-    """Configuration for vLLM-based models."""
-    name: str = "vllm qwen"
+class ServerConfig:
+    """Configuration for OpenAI-compatible inference servers."""
+
+    name: str = "server"
     model: str = "qwen2.5-coder:7b-instruct"
     endpoint: str = "http://localhost:8000"
     api_key: Optional[str] = None
@@ -54,3 +60,19 @@ class VllmConfig:
     top_p: float = 0.9
     timeout: int = 60
 
+
+@dataclass
+class VllmConfig(ServerConfig):
+    """Configuration for vLLM-based models."""
+
+    name: str = "vllm qwen"
+    gpu_memory_utilization: float = 0.85
+
+
+@dataclass
+class LlamaConfig(ServerConfig):
+    """Configuration for llama.cpp-based models."""
+
+    name: str = "llama"
+    n_gpu_layers: int = 99
+    ctx_size: int = 8192

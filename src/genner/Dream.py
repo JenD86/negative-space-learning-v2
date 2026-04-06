@@ -7,6 +7,7 @@ from loguru import logger
 from result import Result, Ok, Err, UnwrapError
 
 from .config import DreamConfig
+from src.observability.types import InferenceResult, UsageInfo
 from src.typing.message import Message
 
 from .Base import Genner
@@ -17,7 +18,7 @@ class DreamGenner(Genner):
         super().__init__("dream")
         self.config = config
 
-    def plist_completion(self, messages: List[Message]) -> Result[str, str]:
+    def plist_completion(self, messages: List[Message]) -> Result[InferenceResult, str]:
         url = f"{self.config.base_url.rstrip('/')}/generate"
 
         payload = {
@@ -42,7 +43,12 @@ class DreamGenner(Genner):
             json_payload = cast(dict[str, Any], r.json())
             text_response = cast(str, json_payload["result"])
 
-            return Ok(text_response)
+            return Ok(
+                InferenceResult(
+                    content=text_response,
+                    usage=self.get_usage_info(json_payload),
+                )
+            )
         except Exception as e:
             return Err(
                 "DreamGenner.plist_completion: Unexpected error,"
@@ -56,7 +62,7 @@ class DreamGenner(Genner):
     ) -> Result[Tuple[str, str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             extracted_code = self.extract_code(raw_response).unwrap()
             return Ok((extracted_code, raw_response))
         except UnwrapError as e:
@@ -102,7 +108,7 @@ class DreamGenner(Genner):
     ) -> Result[Tuple[List[str], str], Tuple[str, Optional[str]]]:
         raw_response: Optional[str] = None
         try:
-            raw_response = self.plist_completion(messages).unwrap()
+            raw_response = self.plist_completion(messages).unwrap().content
             extracted_list = self.extract_list(raw_response).unwrap()
             return Ok((extracted_list, raw_response))
         except UnwrapError as e:
@@ -139,3 +145,30 @@ class DreamGenner(Genner):
                 f"`response`: \n{response}\n"
                 f"`e`: \n{e}\n"
             )
+
+    @staticmethod
+    def get_usage_info(response: object) -> UsageInfo:
+        usage = None
+        if isinstance(response, dict):
+            usage = response.get("usage")
+
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            latency_ms = usage.get("latency_ms")
+            if total_tokens is None and (
+                prompt_tokens is not None or completion_tokens is not None
+            ):
+                total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+            return UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                latency_ms=latency_ms,
+                model=response.get("model") if isinstance(response, dict) else None,
+                stop_reason=response.get("stop_reason") if isinstance(response, dict) else None,
+            )
+
+        return UsageInfo()

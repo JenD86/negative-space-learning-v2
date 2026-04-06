@@ -1,22 +1,40 @@
 dev = true
-model_name = "vllm"
-code_host_cache_path = "./code/Your-Model-Name/code/"
+# model_name = "vllm:Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
+# model_name = "vllm:Qwen/Qwen2.5-1.5B-Instruct"
+model_name = "llama:bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF"
+gpu_memory_utilization = 0.85
+code_host_cache_path = "./code/zero-one/code/"
 container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]
 main_container_idx = 0
 
-# These 2 below are mutually exclusive
-dynamic_container = false
-docker_compose_dir = ""  
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"
 
-train_data_save_folder = "./data/Your-Model-Name/multi-container/train_data"
+train_data_save_folder = "./data/zero-one/multi-container/train_data"
+
+[inference]
+# temperature = 0.5
+max_tokens = 4096
+timeout = 300
+
+# v1 pipeline generation settings
+# count: number of successful generations required per phase
+# max_retries: hard limit on attempts before crashing (per generation target)
 
 [special_egc]
-count = 1
-max_retries = 3
+count = 1       # number of environment-getter codes to generate
+max_retries = 8 # LLM attempts per code (extraction + validation + execution)
 
 [strategy_list]
-max_retries = 3
+max_retries = 8 # LLM attempts to generate a valid strategy list
 
 [strategy_code]
-count = 1
-max_retries = 3
+count = 1       # number of strategy codes to generate
+max_retries = 8 # LLM attempts per code (extraction + validation + execution)
+
+# v2 pipeline settings. Comment out to revert to v1.
+[episode]
+action_budget = 15
+scratchpad_max_chars = 10000
+scratchpad_storage_path = "./data/scratchpad.json"
+success_threshold_kb = 0.0
