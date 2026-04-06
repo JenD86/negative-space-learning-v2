@@ -31,28 +31,6 @@ def make_app_config(
     )
 
 
-class TestBnbModelDetection(unittest.TestCase):
-    def test_detects_bnb_4bit_model(self) -> None:
-        from src.backend.vllm import _is_bnb_model
-
-        self.assertTrue(_is_bnb_model("unsloth/Qwen2.5-Coder-7B-bnb-4bit"))
-
-    def test_detects_bnb_suffix(self) -> None:
-        from src.backend.vllm import _is_bnb_model
-
-        self.assertTrue(_is_bnb_model("some-org/model-bnb-8bit"))
-
-    def test_rejects_non_bnb_model(self) -> None:
-        from src.backend.vllm import _is_bnb_model
-
-        self.assertFalse(_is_bnb_model("Qwen/Qwen2.5-Coder-7B-Instruct"))
-
-    def test_rejects_gguf_model(self) -> None:
-        from src.backend.vllm import _is_bnb_model
-
-        self.assertFalse(_is_bnb_model("bartowski/model-GGUF"))
-
-
 class TestBuildVllmDockerConfig(unittest.TestCase):
     def test_get_network_mode_defaults_to_auto(self) -> None:
         from src.backend.vllm import _get_network_mode
@@ -85,6 +63,19 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
             )
 
         self.assertEqual(vllm_config.chat_template, "{{ messages[0]['content'] }}")
+
+    def test_build_vllm_config_resolves_legacy_model_alias(self) -> None:
+        from src.backend.vllm import _build_vllm_config
+
+        config = make_app_config("vllm:qwen2.5:7b-instruct")
+
+        vllm_config = _build_vllm_config(
+            config,
+            endpoint="http://127.0.0.1:8000",
+            timeout=500,
+        )
+
+        self.assertEqual(vllm_config.model, "Qwen/Qwen2.5-7B-Instruct")
 
     def test_builds_container_command_for_standard_model(self) -> None:
         from src.backend.vllm import _build_container_command
@@ -470,6 +461,33 @@ class TestWaitForVllmReady(unittest.TestCase):
 
         with self.assertRaises(RuntimeError, msg="container exited"):
             _wait_for_vllm_ready("http://localhost:8000/v1/models", mock_container, 60)
+
+    @patch("src.backend.vllm.is_http_ready")
+    @patch("src.backend.vllm.time")
+    def test_tries_multiple_alternate_urls_after_primary_timeout(
+        self, mock_time: MagicMock, mock_http: MagicMock
+    ) -> None:
+        from src.backend.vllm import _wait_for_vllm_ready
+
+        urls = [
+            "http://127.0.0.1:8000/v1/models",
+            "http://10.0.0.8:8000/v1/models",
+            "http://10.0.0.9:8000/v1/models",
+        ]
+        mock_time.time.side_effect = [0, 0, 0, 1, 1, 11, 11, 11, 61]
+        mock_time.sleep = MagicMock()
+        mock_http.side_effect = lambda url: url == urls[2]
+        mock_container = MagicMock()
+        mock_container.status = "running"
+        mock_container.reload = MagicMock()
+
+        ready_url = _wait_for_vllm_ready(urls, mock_container, 60, primary_timeout_s=10)
+
+        self.assertEqual(ready_url, urls[2])
+        self.assertEqual(
+            [call.args[0] for call in mock_http.call_args_list],
+            [urls[0], urls[1], urls[2]],
+        )
 
 
 if __name__ == "__main__":

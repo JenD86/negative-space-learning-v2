@@ -24,6 +24,10 @@ CONTAINER_NAME_PREFIX = "nsl-vllm"
 HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/root/.cache/huggingface"
 VLLM_NETWORK_MODE_ENV = "NSL_VLLM_NETWORK_MODE"
+LEGACY_VLLM_MODEL_ALIASES = {
+    "qwen2.5-coder:7b-instruct": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "qwen2.5:7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+}
 
 
 def _get_host_ip() -> str:
@@ -85,20 +89,6 @@ def _build_models_urls(
     return [models_url, host_models_url]
 
 
-def _is_bnb_model(model: str) -> bool:
-    lower = model.lower()
-    return "bnb-4bit" in lower or "bnb-8bit" in lower
-
-
-def _normalize_vllm_model(model: str) -> str:
-    normalized_model = model.strip()
-    legacy_model_aliases = {
-        "qwen2.5-coder:7b-instruct": "Qwen/Qwen2.5-Coder-7B-Instruct",
-        "qwen2.5:7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
-    }
-    return legacy_model_aliases.get(normalized_model, normalized_model)
-
-
 def _build_vllm_config(
     app_config: AppConfig, endpoint: str, timeout: int
 ) -> VllmConfig:
@@ -106,9 +96,10 @@ def _build_vllm_config(
     if app_config.model_name.startswith("vllm:"):
         config.model = app_config.model_name.split(":", 1)[1].strip()
 
-    resolved_model = _normalize_vllm_model(config.model)
-    if resolved_model != config.model.strip():
-        logger.info(f"Resolved model alias '{config.model}' to '{resolved_model}'")
+    normalized_model = config.model.strip()
+    resolved_model = LEGACY_VLLM_MODEL_ALIASES.get(normalized_model, normalized_model)
+    if resolved_model != normalized_model:
+        logger.info(f"Resolved model alias '{normalized_model}' to '{resolved_model}'")
     config.model = resolved_model
     config.endpoint = endpoint
     config.timeout = timeout
@@ -138,7 +129,8 @@ def _build_container_command(
     ]
     if chat_template:
         cmd.extend(["--chat-template", chat_template])
-    if _is_bnb_model(model):
+    lower_model = model.lower()
+    if "bnb-4bit" in lower_model or "bnb-8bit" in lower_model:
         cmd.extend(["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"])
     return cmd
 
@@ -215,40 +207,25 @@ def _wait_for_vllm_ready(
 
     primary_url = models_urls[0]
     alternate_urls = models_urls[1:]
-
     primary_deadline = time.time() + min(primary_timeout_s, timeout_s)
-    while time.time() < primary_deadline:
-        if is_http_ready(primary_url):
-            return primary_url
-
-        container.reload()
-        if container.status in ("exited", "dead"):
-            logs = container.logs(tail=50).decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"vLLM container exited unexpectedly (status={container.status}). "
-                f"Logs:\n{logs}"
-            )
-
-        elapsed = time.time() - start_time
-        if elapsed >= next_log_at:
-            logger.info(
-                f"Waiting for vLLM readiness... ({int(elapsed)}s / {timeout_s}s)"
-            )
-            next_log_at += 30.0
-
-        time.sleep(2)
-
-    if alternate_urls:
-        current_url = alternate_urls[0]
-        logger.info(
-            f"Primary endpoint unreachable, switching to alternate: {current_url}"
-        )
-    else:
-        current_url = primary_url
-
+    last_checked_url = primary_url
+    using_alternates = False
     while time.time() < deadline:
-        if is_http_ready(current_url):
-            return current_url
+        if not using_alternates and alternate_urls and time.time() >= primary_deadline:
+            using_alternates = True
+            logger.info(
+                "Primary endpoint unreachable, switching to alternate: "
+                f"{alternate_urls[0]}"
+            )
+
+        candidate_urls = alternate_urls if using_alternates else [primary_url]
+        if not candidate_urls:
+            candidate_urls = [primary_url]
+
+        for current_url in candidate_urls:
+            last_checked_url = current_url
+            if is_http_ready(current_url):
+                return current_url
 
         container.reload()
         if container.status in ("exited", "dead"):
@@ -269,7 +246,7 @@ def _wait_for_vllm_ready(
 
     logs = container.logs(tail=30).decode("utf-8", errors="replace")
     raise TimeoutError(
-        f"Timed out waiting for vLLM readiness at {current_url} after {timeout_s}s. "
+        f"Timed out waiting for vLLM readiness at {last_checked_url} after {timeout_s}s. "
         f"Recent logs:\n{logs}"
     )
 
