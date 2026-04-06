@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -64,6 +64,25 @@ class AppConfig(BaseModel):
         success_threshold_kb: float = 0.0  # ΔR > 0
 
     episode: Optional[EpisodeConfig] = None
+
+    class GenerationConfig(BaseModel):
+        target_successful_rows: int = 4500
+        max_episodes: int = 10000
+        container_restart_interval: int = 10
+        container_rebuild_interval: int = 10
+        success_threshold_kb: float = 0.0
+        variation_strategy: Literal["round_robin", "random"] = "round_robin"
+        variation_random_seed: Optional[int] = None
+        post_rebuild_wait_seconds: int = 10
+        population_verification_tolerance: float = 0.20
+        checkpoint_every_episode: bool = True
+        resume_from_checkpoint: bool = True
+        show_progress: bool = True
+        resource_snapshot_interval_episodes: int = 1
+        generation_output_dir: str = "./data/generations"
+        reset_scratchpad_between_episodes: bool = True
+
+    generation: Optional[GenerationConfig] = None
 
     @model_validator(mode="before")
     @classmethod

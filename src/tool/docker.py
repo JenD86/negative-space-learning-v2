@@ -428,11 +428,29 @@ def wait_and_get_container(
 ) -> DockerContainer:
     """Wait for container to be fully running and return the container object."""
     start_time = time.time()
+    terminal_states = {"exited", "dead"}
 
     while time.time() - start_time < timeout:
         try:
             container = client.containers.get(container_name)
             container.reload()
+
+            if container.status in terminal_states:
+                logs = ""
+                try:
+                    logs_output = container.logs(tail=20)
+                    logs = (
+                        logs_output.decode("utf-8", errors="replace")
+                        if isinstance(logs_output, bytes)
+                        else str(logs_output)
+                    ).strip()
+                except Exception:
+                    logs = "<unavailable>"
+
+                detail = f" Last logs:\n{logs}" if logs else ""
+                raise RuntimeError(
+                    f"Container {container_name} is in terminal state '{container.status}'.{detail}"
+                )
 
             if container.status == "running":
                 # Test if container is truly ready by running a simple command

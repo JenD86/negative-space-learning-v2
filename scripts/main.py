@@ -1060,6 +1060,9 @@ def run_episode_v2(
     docker_client: docker.DockerClient,
     containers: List[DockerContainer],
     config: AppConfig,
+    run_id: Optional[str] = None,
+    commit_id: Optional[str] = None,
+    save_incremental: bool = True,
 ) -> Dict[str, Any]:
     """Unified mode system with orchestrator → mode delegation."""
 
@@ -1073,8 +1076,11 @@ def run_episode_v2(
         host_cache_folder=Path(config.code_host_cache_path) / "episode_v2_mode",
     )
 
+    run_id = run_id or RUN_ID
+    commit_id = commit_id or COMMIT_ID
+
     # Start episode
-    episode_id = f"ep_{RUN_ID}_{int(time.time())}"
+    episode_id = f"ep_{run_id}_{int(time.time())}"
     mode_controller.start_episode(episode_id)
 
     # Measure initial disk space (preserve existing measurement logic)
@@ -1093,6 +1099,8 @@ def run_episode_v2(
 
     # Collect all prompt/response pairs for training data
     all_prompt_responses = []
+    partial = False
+    error_message: Optional[str] = None
 
     logger.info(f"Starting episode {episode_id} with unified mode system")
     logger.info(f"Orchestrator budget: {mode_controller.budget.total_budget} decisions")
@@ -1154,8 +1162,8 @@ def run_episode_v2(
                 for prompt_resp in all_prompt_responses:
                     current_step_data.append(
                         {
-                            "run_id": RUN_ID,
-                            "version": COMMIT_ID,
+                            "run_id": run_id,
+                            "version": commit_id,
                             "prompt": prompt_resp["prompt"],
                             "raw_response": prompt_resp["raw_response"],
                             "interaction_type": prompt_resp["interaction_type"],
@@ -1166,11 +1174,12 @@ def run_episode_v2(
                     )
 
                 # Save incremental data
-                save_train_data(
-                    f"episode_v2_step_{len(mode_controller.episode_state.mode_history)}",
-                    current_step_data,
-                    config.train_data_save_folder,
-                )
+                if save_incremental:
+                    save_train_data(
+                        f"episode_v2_step_{len(mode_controller.episode_state.mode_history)}",
+                        current_step_data,
+                        config.train_data_save_folder,
+                    )
 
             # 3. Update episode state
             mode_controller.episode_state.add_mode_execution(
@@ -1190,21 +1199,28 @@ def run_episode_v2(
             logger.error(f"Mode execution error: {e}")
             # Add error to scratchpad
             mode_controller.scratchpad.append(f"Episode failed: {e}")
+            partial = True
+            error_message = str(e)
             break
 
     # Measure final disk space (preserve existing measurement logic)
     final_free_space: Dict[str, float] = {}
     space_measurements: Dict[str, Tuple[float, float]] = {}
+    measurement_errors: List[str] = []
 
     for i, container in enumerate(containers):
         assert container.id is not None
-        final_free_space[container.id] = get_container_free_disk_space_kb_v2(container)
-        space_freed = final_free_space[container.id] - initial_free_space[container.id]
-        space_measurements[container.id] = (
-            initial_free_space[container.id],
-            final_free_space[container.id],
-        )
-        logger.info(f"Container {i}: {space_freed:.2f} KB freed")
+        try:
+            final_free_space[container.id] = get_container_free_disk_space_kb_v2(container)
+            space_freed = final_free_space[container.id] - initial_free_space[container.id]
+            space_measurements[container.id] = (
+                initial_free_space[container.id],
+                final_free_space[container.id],
+            )
+            logger.info(f"Container {i}: {space_freed:.2f} KB freed")
+        except Exception as e:
+            logger.error(f"Container {i} final measurement failed: {e}")
+            measurement_errors.append(container.id)
 
     total_space_freed = calculate_deduplicated_space_freed(
         space_measurements,
@@ -1225,8 +1241,14 @@ def run_episode_v2(
         "prompt_responses": all_prompt_responses,  # All orchestrator + mode conversations
         "space_freed_kb": total_space_freed,
         "success": total_space_freed > 0.0,
+        "episode_runtime_success": total_space_freed > 0.0,
         "episode_id": episode_id,
         "action_count": len(mode_controller.episode_state.mode_history),
+        "partial": partial,
+        "error_message": error_message,
+        "space_measurements": space_measurements,
+        "filesystem_groups": [group.__dict__ for group in filesystem_groups],
+        "measurement_errors": measurement_errors,
     }
 
 
