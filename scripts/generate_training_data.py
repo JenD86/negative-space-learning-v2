@@ -18,7 +18,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.container import ContainerManager
-from src.helper import generate_readable_run_id, humanize_number, unflatten_toml_dict
+from src.helper import generate_readable_run_id, unflatten_toml_dict
 from src.observability.types import UtilizationSummary
 from src.scratchpad import CrossEpisodeScratchpad
 from src.typing.config import AppConfig
@@ -472,11 +472,7 @@ def run_generation(
             rows_progress.update(generation_data.total_rows_collected - previous_rows)
             elapsed_hours = (time.perf_counter() - generation_started_at) / 3600
             if elapsed_hours > 0:
-                episode_postfix: dict[str, str] = {
-                    "ep/hr": humanize_number(
-                        generation_data.total_episodes_run / elapsed_hours
-                    )
-                }
+                episode_postfix: dict[str, str] = {}
                 if episode.average_output_tokens_per_second is not None:
                     episode_postfix["tok/s"] = (
                         f"{episode.average_output_tokens_per_second:.1f}"
@@ -487,7 +483,8 @@ def run_generation(
                     episode_postfix["gpu"] = f"{episode.peak_gpu_utilization_pct:.0f}%"
                 if episode.peak_cpu_utilization_pct is not None:
                     episode_postfix["cpu"] = f"{episode.peak_cpu_utilization_pct:.0f}%"
-                episode_progress.set_postfix(episode_postfix)
+                if episode_postfix:
+                    episode_progress.set_postfix(episode_postfix)
                 rows_progress.set_postfix(
                     {
                         "rows/hr": (

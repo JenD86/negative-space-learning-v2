@@ -998,7 +998,6 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(postfix["duty"], "75%")
         self.assertEqual(postfix["gpu"], "82%")
         self.assertEqual(postfix["cpu"], "37%")
-        self.assertEqual(postfix["ep/hr"], "2.0")
         self.assertEqual(row_postfix["rows/hr"], "40.0")
 
     def test_save_generation_data_output_structure(self) -> None:
