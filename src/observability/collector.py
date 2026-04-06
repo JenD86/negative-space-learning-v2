@@ -2,11 +2,14 @@ import json
 import threading
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
 from src.observability.types import InferenceMetric, PhaseMetric, ResourceSnapshot
+
+if TYPE_CHECKING:
+    from src.typing.config import AppConfig
 
 
 class MetricsCollector:
@@ -39,6 +42,19 @@ class MetricsCollector:
             "_output_tokens_per_second_sum": 0.0,
             "_total_tokens_per_second_sum": 0.0,
         }
+
+    @classmethod
+    def from_config(cls, config: "AppConfig", run_id: str) -> "MetricsCollector":
+        observability = config.observability
+        output_dir = observability.metrics_output_path or config.train_data_save_folder
+        return cls(
+            run_id=run_id,
+            output_dir=output_dir,
+            enabled=observability.enabled,
+            record_inference=observability.record_inference,
+            record_phases=observability.record_phases,
+            record_resources=observability.record_resources,
+        )
 
     @property
     def output_path(self) -> Path:

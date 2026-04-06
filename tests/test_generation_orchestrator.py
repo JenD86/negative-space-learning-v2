@@ -360,6 +360,42 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(manager.restart.call_count, 1)
 
     @patch("scripts.generate_training_data.run_episode_v2")
+    def test_run_single_episode_passes_design_format_episode_id(
+        self,
+        run_episode_v2: MagicMock,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            manager = MagicMock()
+            manager.populate.return_value = [
+                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
+            ]
+            manager.verify_population.return_value = {"success": True}
+
+            def _run_episode_side_effect(
+                *args: object, **kwargs: object
+            ) -> dict[str, object]:
+                return self.make_episode_result(episode_id=str(kwargs["episode_id"]))
+
+            run_episode_v2.side_effect = _run_episode_side_effect
+
+            trajectory = run_single_episode(
+                genner=MagicMock(),
+                docker_client=MagicMock(),
+                container_manager=manager,
+                config=config,
+                generation_id=3,
+                episode_index=42,
+                variation_index=0,
+                run_id="run-123",
+            )
+
+        actual_episode_id = str(run_episode_v2.call_args.kwargs.get("episode_id", ""))
+        self.assertRegex(actual_episode_id, r"^ep_gen3_0042_\d{10,}$")
+        self.assertEqual(trajectory.episode_id, actual_episode_id)
+
+    @patch("scripts.generate_training_data.run_episode_v2")
     def test_container_populate_every_episode(self, run_episode_v2: MagicMock) -> None:
         with TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)

@@ -2,6 +2,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
@@ -75,9 +76,12 @@ def run_single_episode(
     started_at = datetime.now().isoformat()
     generation_config = config.generation or AppConfig.GenerationConfig()
     episode_config = config.episode or AppConfig.EpisodeConfig()
+    episode_id = f"ep_gen{generation_id}_{episode_index:04d}_{int(time.time())}"
     population_results = container_manager.populate(variation_index)
     primary_population = population_results[0] if population_results else None
-    variation_name = getattr(primary_population, "variation_name", f"variation_{variation_index}")
+    variation_name = getattr(
+        primary_population, "variation_name", f"variation_{variation_index}"
+    )
     expected_kb = getattr(primary_population, "expected_kb", 0)
     verification = container_manager.verify_population(
         expected_kb,
@@ -87,7 +91,7 @@ def run_single_episode(
     if not verification.get("success", False):
         completed_at = datetime.now().isoformat()
         return EpisodeTrajectory(
-            episode_id=f"ep_gen{generation_id}_{episode_index}",
+            episode_id=episode_id,
             generation_id=generation_id,
             episode_index=episode_index,
             prompt_responses=[],
@@ -123,11 +127,12 @@ def run_single_episode(
             config,
             run_id=run_id,
             save_incremental=False,
+            episode_id=episode_id,
         )
     except Exception as exc:
         completed_at = datetime.now().isoformat()
         return EpisodeTrajectory(
-            episode_id=f"ep_gen{generation_id}_{episode_index}",
+            episode_id=episode_id,
             generation_id=generation_id,
             episode_index=episode_index,
             prompt_responses=[],
@@ -149,11 +154,13 @@ def run_single_episode(
     completed_at = datetime.now().isoformat()
     space_freed_kb = float(episode_result.get("space_freed_kb", 0.0))
     episode_runtime_success = bool(
-        episode_result.get("episode_runtime_success", episode_result.get("success", False))
+        episode_result.get(
+            "episode_runtime_success", episode_result.get("success", False)
+        )
     )
     success = space_freed_kb > generation_config.success_threshold_kb
     return EpisodeTrajectory(
-        episode_id=str(episode_result.get("episode_id", f"ep_gen{generation_id}_{episode_index}")),
+        episode_id=str(episode_result.get("episode_id", episode_id)),
         generation_id=generation_id,
         episode_index=episode_index,
         prompt_responses=list(episode_result.get("prompt_responses", [])),
@@ -241,8 +248,12 @@ def run_generation(
         checkpoint = load_generation_checkpoint(checkpoint_path)
         if checkpoint is not None:
             start_episode_index = int(checkpoint.get("next_episode_index", 0))
-            generation_data = _load_existing_generation_data(all_episodes_path, generation_id)
-            generation_data.started_at = checkpoint.get("started_at") or generation_data.started_at
+            generation_data = _load_existing_generation_data(
+                all_episodes_path, generation_id
+            )
+            generation_data.started_at = (
+                checkpoint.get("started_at") or generation_data.started_at
+            )
 
     if generation_data.started_at is None:
         generation_data.started_at = datetime.now().isoformat()
@@ -282,12 +293,17 @@ def run_generation(
 
     try:
         for episode_index in range(start_episode_index, generation_config.max_episodes):
-            if generation_data.total_rows_collected >= generation_config.target_successful_rows:
+            if (
+                generation_data.total_rows_collected
+                >= generation_config.target_successful_rows
+            ):
                 break
             if (
                 metrics_collector is not None
                 and generation_config.resource_snapshot_interval_episodes > 0
-                and episode_index % generation_config.resource_snapshot_interval_episodes == 0
+                and episode_index
+                % generation_config.resource_snapshot_interval_episodes
+                == 0
             ):
                 metrics_collector.snapshot_resources()
 
@@ -316,7 +332,9 @@ def run_generation(
             if generation_config.checkpoint_every_episode:
                 append_episode_jsonl(episode.to_dict(), all_episodes_path)
                 save_generation_checkpoint(
-                    _build_checkpoint_payload(generation_data, episode_index + 1, run_id),
+                    _build_checkpoint_payload(
+                        generation_data, episode_index + 1, run_id
+                    ),
                     checkpoint_path,
                 )
 
@@ -324,13 +342,15 @@ def run_generation(
             if (
                 generation_config.container_rebuild_interval > 0
                 and completed_episodes < generation_config.max_episodes
-                and completed_episodes % generation_config.container_rebuild_interval == 0
+                and completed_episodes % generation_config.container_rebuild_interval
+                == 0
             ):
                 container_manager.rebuild()
             elif (
                 generation_config.container_restart_interval > 0
                 and completed_episodes < generation_config.max_episodes
-                and completed_episodes % generation_config.container_restart_interval == 0
+                and completed_episodes % generation_config.container_restart_interval
+                == 0
             ):
                 container_manager.restart()
     finally:
@@ -401,20 +421,6 @@ def save_generation_data(
     return generation_dir
 
 
-def _build_metrics_collector(config: AppConfig, run_id: str):
-    from src.observability import MetricsCollector
-
-    output_dir = config.observability.metrics_output_path or config.train_data_save_folder
-    return MetricsCollector(
-        run_id=run_id,
-        output_dir=output_dir,
-        enabled=config.observability.enabled,
-        record_inference=config.observability.record_inference,
-        record_phases=config.observability.record_phases,
-        record_resources=config.observability.record_resources,
-    )
-
-
 def main() -> Path:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config-generation.toml")
@@ -435,10 +441,11 @@ def main() -> Path:
         config.generation.target_successful_rows = args.target_rows
 
     run_id = generate_readable_run_id()
-    metrics_collector = _build_metrics_collector(config, run_id)
 
     from src.backend import resolve_backend_context
-    from src.observability import MetricsGenner
+    from src.observability import MetricsCollector, MetricsGenner
+
+    metrics_collector = MetricsCollector.from_config(config, run_id)
 
     docker_client = docker.from_env()
     backend_context = resolve_backend_context(config)

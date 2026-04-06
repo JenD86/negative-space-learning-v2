@@ -64,20 +64,6 @@ RUN_ID = generate_readable_run_id()
 COMMIT_ID = get_formatted_repo_info()
 
 
-def _build_metrics_collector(config: AppConfig) -> MetricsCollector:
-    output_dir = (
-        config.observability.metrics_output_path or config.train_data_save_folder
-    )
-    return MetricsCollector(
-        run_id=RUN_ID,
-        output_dir=output_dir,
-        enabled=config.observability.enabled,
-        record_inference=config.observability.record_inference,
-        record_phases=config.observability.record_phases,
-        record_resources=config.observability.record_resources,
-    )
-
-
 def _record_phase_metric(
     collector: MetricsCollector,
     phase_name: str,
@@ -123,7 +109,7 @@ def main(config_file: str = "./config/config-container.toml"):
         logger.info(f"Config validation error: {e}")
         return
 
-    metrics_collector = _build_metrics_collector(config)
+    metrics_collector = MetricsCollector.from_config(config, RUN_ID)
     metrics_output_path: Optional[str] = None
 
     full_run_data = {
@@ -1063,6 +1049,7 @@ def run_episode_v2(
     run_id: Optional[str] = None,
     commit_id: Optional[str] = None,
     save_incremental: bool = True,
+    episode_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Unified mode system with orchestrator → mode delegation."""
 
@@ -1080,7 +1067,7 @@ def run_episode_v2(
     commit_id = commit_id or COMMIT_ID
 
     # Start episode
-    episode_id = f"ep_{run_id}_{int(time.time())}"
+    episode_id = episode_id or f"ep_{run_id}_{int(time.time())}"
     mode_controller.start_episode(episode_id)
 
     # Measure initial disk space (preserve existing measurement logic)
@@ -1211,8 +1198,12 @@ def run_episode_v2(
     for i, container in enumerate(containers):
         assert container.id is not None
         try:
-            final_free_space[container.id] = get_container_free_disk_space_kb_v2(container)
-            space_freed = final_free_space[container.id] - initial_free_space[container.id]
+            final_free_space[container.id] = get_container_free_disk_space_kb_v2(
+                container
+            )
+            space_freed = (
+                final_free_space[container.id] - initial_free_space[container.id]
+            )
             space_measurements[container.id] = (
                 initial_free_space[container.id],
                 final_free_space[container.id],

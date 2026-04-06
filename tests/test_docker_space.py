@@ -1,4 +1,5 @@
 import unittest
+from typing import Dict, Tuple
 from unittest.mock import MagicMock, patch
 
 from src.tool.docker import (
@@ -25,6 +26,53 @@ class DockerSpaceDedupTests(unittest.TestCase):
         total_freed_kb = calculate_deduplicated_space_freed(measurements, groups)
 
         self.assertEqual(total_freed_kb, 352.0)
+
+    def test_all_containers_in_group_fail_measurement_returns_zero(self) -> None:
+        measurements: Dict[str, Tuple[float, float]] = {}
+        groups = [
+            FilesystemGroup(
+                filesystem_id="fs_shared",
+                container_ids=["container_a", "container_b"],
+            )
+        ]
+
+        total_freed_kb = calculate_deduplicated_space_freed(measurements, groups)
+
+        self.assertEqual(total_freed_kb, 0.0)
+
+    def test_mixed_groups_some_with_no_measurements(self) -> None:
+        measurements = {
+            "container_c": (500.0, 800.0),
+        }
+        groups = [
+            FilesystemGroup(
+                filesystem_id="fs_1",
+                container_ids=["container_a", "container_b"],
+            ),
+            FilesystemGroup(
+                filesystem_id="fs_2",
+                container_ids=["container_c"],
+            ),
+        ]
+
+        total_freed_kb = calculate_deduplicated_space_freed(measurements, groups)
+
+        self.assertEqual(total_freed_kb, 300.0)
+
+    def test_partial_container_failure_within_group(self) -> None:
+        measurements = {
+            "container_a": (1000.0, 1400.0),
+        }
+        groups = [
+            FilesystemGroup(
+                filesystem_id="fs_shared",
+                container_ids=["container_a", "container_b"],
+            )
+        ]
+
+        total_freed_kb = calculate_deduplicated_space_freed(measurements, groups)
+
+        self.assertEqual(total_freed_kb, 400.0)
 
     @patch("src.tool.docker.get_container_backing_fs_id")
     def test_groups_containers_by_shared_filesystem(
