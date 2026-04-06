@@ -15,19 +15,21 @@ class ExecResult:
 
 
 class ContainerManagerTests(unittest.TestCase):
-    def make_manager(self) -> tuple[ContainerManager, MagicMock, MagicMock, MagicMock]:
+    def make_manager(
+        self, exec_return: bytes = b"ok"
+    ) -> tuple[ContainerManager, MagicMock, MagicMock, MagicMock]:
         docker_client = MagicMock()
         container_a = MagicMock()
         container_a.id = "container-a"
         container_a.name = "special-learn-compose_service-a_1"
         container_a.status = "running"
-        container_a.exec_run.return_value = ExecResult(0, b"ok")
+        container_a.exec_run.return_value = ExecResult(0, exec_return)
 
         container_b = MagicMock()
         container_b.id = "container-b"
         container_b.name = "special-learn-compose_service-b_1"
         container_b.status = "running"
-        container_b.exec_run.return_value = ExecResult(0, b"ok")
+        container_b.exec_run.return_value = ExecResult(0, exec_return)
 
         containers_by_id = {
             "container-a": container_a,
@@ -51,27 +53,92 @@ class ContainerManagerTests(unittest.TestCase):
     def test_populate_applies_variation(self) -> None:
         manager, _, container_a, container_b = self.make_manager()
 
-        results = manager.populate(0)
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": 100.0, "container-b": 110.0},
+        ):
+            results, baseline = manager.populate(0)
 
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].variation_name, "variation_1_heavy")
         self.assertEqual(results[0].expected_kb, 15500)
+        # 1 cleanup + 7 variation commands = 8 exec_run calls per container
         self.assertEqual(container_a.exec_run.call_count, 8)
         self.assertEqual(container_b.exec_run.call_count, 8)
 
-    def test_verify_population_checks_expected_kb_with_tolerance(self) -> None:
+    def test_populate_returns_baseline_measurements(self) -> None:
         manager, _, _, _ = self.make_manager()
+
         with patch.object(
             manager,
             "_measure_population_kb",
-            return_value={"container-a": 300.0, "container-b": 310.0},
+            return_value={"container-a": 50000.0, "container-b": 51000.0},
         ):
-            report = manager.verify_population(expected_kb=1000, tolerance=0.2)
+            results, baseline = manager.populate(0)
+
+        self.assertEqual(baseline, {"container-a": 50000.0, "container-b": 51000.0})
+
+    def test_verify_population_delta_outside_tolerance_fails(self) -> None:
+        """Delta (measured - baseline) is too small relative to expected_kb."""
+        manager, _, _, _ = self.make_manager()
+        baseline_kb = {"container-a": 50000.0, "container-b": 50000.0}
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": 50300.0, "container-b": 50310.0},
+        ):
+            report = manager.verify_population(
+                expected_kb=1000, tolerance=0.2, baseline_kb=baseline_kb
+            )
 
         self.assertFalse(report["success"])
         self.assertFalse(report["containers"]["container-a"]["within_tolerance"])
+        self.assertAlmostEqual(report["containers"]["container-a"]["delta_kb"], 300.0)
         self.assertEqual(report["lower_bound_kb"], 800.0)
         self.assertEqual(report["upper_bound_kb"], 1200.0)
+
+    def test_verify_population_delta_within_tolerance_passes(self) -> None:
+        """Delta matches expected_kb despite large base content in containers."""
+        manager, _, _, _ = self.make_manager()
+        # Simulate 50MB base content (venv, documents, etc.)
+        baseline_kb = {"container-a": 50000.0, "container-b": 50000.0}
+        # After population: base + variation files
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": 65500.0, "container-b": 65000.0},
+        ):
+            report = manager.verify_population(
+                expected_kb=15500, tolerance=0.2, baseline_kb=baseline_kb
+            )
+
+        self.assertTrue(report["success"])
+        self.assertTrue(report["containers"]["container-a"]["within_tolerance"])
+        self.assertTrue(report["containers"]["container-b"]["within_tolerance"])
+        self.assertAlmostEqual(
+            report["containers"]["container-a"]["delta_kb"], 15500.0
+        )
+        self.assertAlmostEqual(
+            report["containers"]["container-a"]["baseline_kb"], 50000.0
+        )
+
+    def test_verify_population_reports_per_container_details(self) -> None:
+        """One container passes, one fails — overall result is failure."""
+        manager, _, _, _ = self.make_manager()
+        baseline_kb = {"container-a": 50000.0, "container-b": 50000.0}
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": 65500.0, "container-b": 52000.0},
+        ):
+            report = manager.verify_population(
+                expected_kb=15500, tolerance=0.2, baseline_kb=baseline_kb
+            )
+
+        self.assertFalse(report["success"])
+        self.assertTrue(report["containers"]["container-a"]["within_tolerance"])
+        self.assertFalse(report["containers"]["container-b"]["within_tolerance"])
 
     @patch("src.container.subprocess.run")
     def test_rebuild_calls_compose_with_build_flag(
@@ -251,6 +318,22 @@ class ContainerManagerTests(unittest.TestCase):
                 call(manager.docker_client, "container-b"),
             ]
         )
+
+
+    def test_cleanup_command_includes_var_tmp_and_dotfiles(self) -> None:
+        manager, _, container_a, _ = self.make_manager()
+        with patch.object(
+            manager,
+            "_measure_population_kb",
+            return_value={"container-a": 0.0, "container-b": 0.0},
+        ):
+            manager.populate(0)
+
+        # Inspect the first exec_run call (cleanup command)
+        cleanup_call = container_a.exec_run.call_args_list[0]
+        cleanup_cmd = cleanup_call[0][0]  # positional arg
+        self.assertIn("/var/tmp/", cleanup_cmd)
+        self.assertIn("/tmp/.[!.]*", cleanup_cmd)
 
 
 if __name__ == "__main__":

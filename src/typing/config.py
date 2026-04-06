@@ -81,6 +81,7 @@ class AppConfig(BaseModel):
         resource_snapshot_interval_episodes: int = 1
         generation_output_dir: str = "./data/generations"
         reset_scratchpad_between_episodes: bool = True
+        max_consecutive_verification_failures: int = 5
 
     generation: Optional[GenerationConfig] = None
 

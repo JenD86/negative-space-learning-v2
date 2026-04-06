@@ -133,7 +133,7 @@ def run_single_episode(
 
     container_started_at = time.perf_counter()
     try:
-        population_results = container_manager.populate(variation_index)
+        population_results, baseline_kb = container_manager.populate(variation_index)
     except Exception:
         _stop_utilization_sampling()
         raise
@@ -147,6 +147,7 @@ def run_single_episode(
         verification = container_manager.verify_population(
             expected_kb,
             generation_config.population_verification_tolerance,
+            baseline_kb=baseline_kb,
         )
     except Exception:
         _stop_utilization_sampling()
@@ -440,6 +441,7 @@ def run_generation(
         initial=generation_data.total_rows_collected,
     )
     generation_started_at = time.perf_counter()
+    consecutive_verification_failures = 0
 
     try:
         for episode_index in range(start_episode_index, generation_config.max_episodes):
@@ -468,6 +470,34 @@ def run_generation(
                 metrics_collector=metrics_collector,
             )
             generation_data.add_episode(episode)
+
+            # Circuit breaker: detect systematic verification failures
+            if (
+                episode.error_message
+                == "container population verification failed"
+            ):
+                consecutive_verification_failures += 1
+                logger.warning(
+                    f"Episode {episode_index}: container population verification "
+                    f"failed ({consecutive_verification_failures} consecutive). "
+                    f"Variation: {episode.container_variation}"
+                )
+                if (
+                    generation_config.max_consecutive_verification_failures > 0
+                    and consecutive_verification_failures
+                    >= generation_config.max_consecutive_verification_failures
+                ):
+                    logger.error(
+                        f"Circuit breaker tripped: "
+                        f"{consecutive_verification_failures} consecutive "
+                        f"container population verification failures. "
+                        f"This indicates a systematic issue with the container "
+                        f"setup. Aborting generation."
+                    )
+                    break
+            else:
+                consecutive_verification_failures = 0
+
             episode_progress.update(1)
             rows_progress.update(generation_data.total_rows_collected - previous_rows)
             elapsed_hours = (time.perf_counter() - generation_started_at) / 3600

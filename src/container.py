@@ -56,20 +56,32 @@ class ContainerManager:
             self.container_ids = refreshed[: len(self.container_ids)]
         return list(self.container_ids)
 
-    def populate(self, variation_index: int) -> List[ContainerPopulationResult]:
+    def populate(
+        self, variation_index: int
+    ) -> tuple[List[ContainerPopulationResult], Dict[str, float]]:
         variations = self.get_mixed_cleanup_variations()
         variation = variations[variation_index % len(variations)]
         cleanup_command = (
-            "sh -c 'rm -rf /tmp/* /var/cache/* /var/log/* /home/alice/trash "
-            "/home/alice/.cache /home/alice/.local/share/Trash /home/alice/old "
+            "sh -c 'rm -rf /tmp/* /tmp/.[!.]* /tmp/..?* "
+            "/var/cache/* /var/log/* /var/tmp/* "
+            "/home/alice/trash /home/alice/.cache "
+            "/home/alice/.local/share/Trash /home/alice/old "
             "/home/alice/temp 2>/dev/null || true'"
         )
         results: List[ContainerPopulationResult] = []
 
+        # Phase 1: cleanup all containers
+        for container_id in self.container_ids:
+            container = self.docker_client.containers.get(container_id)
+            container.exec_run(cleanup_command, stdout=False, stderr=False)
+
+        # Phase 2: measure baseline after cleanup
+        baseline_kb = self._measure_population_kb()
+
+        # Phase 3: create variation files
         for container_id in self.container_ids:
             try:
                 container = self.docker_client.containers.get(container_id)
-                container.exec_run(cleanup_command, stdout=False, stderr=False)
                 for command in variation["commands"]:
                     container.exec_run(
                         ["sh", "-c", command], stdout=False, stderr=False
@@ -96,7 +108,7 @@ class ContainerManager:
                         error_message=str(exc),
                     )
                 )
-        return results
+        return results, baseline_kb
 
     def _measure_population_kb(self) -> Dict[str, float]:
         command = """
@@ -127,18 +139,32 @@ class ContainerManager:
         self,
         expected_kb: int,
         tolerance: float,
+        baseline_kb: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         lower_bound_kb = expected_kb * (1.0 - tolerance)
         upper_bound_kb = expected_kb * (1.0 + tolerance)
         containers: Dict[str, Dict[str, Any]] = {}
         success = True
+        effective_baseline = baseline_kb or {}
 
         for container_id, measured_kb in self._measure_population_kb().items():
-            within_tolerance = lower_bound_kb <= measured_kb <= upper_bound_kb
+            container_baseline = effective_baseline.get(container_id, 0.0)
+            delta_kb = measured_kb - container_baseline
+            within_tolerance = lower_bound_kb <= delta_kb <= upper_bound_kb
             containers[container_id] = {
                 "measured_kb": measured_kb,
+                "baseline_kb": container_baseline,
+                "delta_kb": delta_kb,
                 "within_tolerance": within_tolerance,
             }
+            if not within_tolerance:
+                logger.warning(
+                    f"Container {container_id} population verification failed: "
+                    f"delta={delta_kb:.1f}KB (measured={measured_kb:.1f}KB - "
+                    f"baseline={container_baseline:.1f}KB), "
+                    f"expected={expected_kb}KB ±{tolerance:.0%} "
+                    f"[{lower_bound_kb:.1f}–{upper_bound_kb:.1f}KB]"
+                )
             success = success and within_tolerance
 
         return {

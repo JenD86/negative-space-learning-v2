@@ -33,6 +33,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
             "resource_snapshot_interval_episodes": 1,
             "generation_output_dir": str(base_dir / "generations"),
             "reset_scratchpad_between_episodes": True,
+            "max_consecutive_verification_failures": 0,
         }
         generation_config.update(generation_overrides)
         return AppConfig(
@@ -388,9 +389,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
 
             def _run_episode_side_effect(
@@ -421,9 +423,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_4_large_sparse", expected_kb=19400)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_4_large_sparse", expected_kb=19400)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             run_episode_v2.return_value = self.make_episode_result(
                 episode_id="ep-0",
@@ -445,7 +448,9 @@ class GenerationOrchestratorTests(unittest.TestCase):
             )
 
         manager.populate.assert_called_once_with(3)
-        manager.verify_population.assert_called_once_with(19400, 0.2)
+        manager.verify_population.assert_called_once_with(
+            19400, 0.2, baseline_kb={"container-a": 0.0}
+        )
         self.assertEqual(trajectory.container_variation, "variation_4_large_sparse")
         self.assertEqual(len(trajectory.prompt_responses), 2)
 
@@ -456,9 +461,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": False}
             metrics_collector = MagicMock()
             metrics_collector.summary.return_value = {}
@@ -500,7 +506,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = []
+            manager.populate.return_value = ([], {"container-a": 0.0})
 
             with self.assertRaisesRegex(RuntimeError, "populate returned no results"):
                 run_single_episode(
@@ -525,9 +531,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             scratchpad_path.write_text("stale scratchpad", encoding="utf-8")
             config = self.make_config(base_dir, reset_scratchpad_between_episodes=True)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             run_episode_v2.return_value = self.make_episode_result(episode_id="ep-0")
 
@@ -554,9 +561,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             scratchpad_path.write_text("keep me", encoding="utf-8")
             config = self.make_config(base_dir, reset_scratchpad_between_episodes=False)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             run_episode_v2.return_value = self.make_episode_result(episode_id="ep-0")
 
@@ -582,9 +590,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             scratchpad_path = base_dir / "scratchpad.json"
             config = self.make_config(base_dir, reset_scratchpad_between_episodes=True)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
 
             def write_scratchpad(*args: object, **kwargs: object) -> dict[str, object]:
@@ -653,9 +662,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             run_episode_v2.return_value = self.make_episode_result(
                 episode_id="ep-0",
@@ -690,9 +700,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             run_episode_v2.side_effect = RuntimeError("df -k / failed")
 
@@ -806,9 +817,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             manager.get_containers.return_value = [MagicMock(), MagicMock()]
             metrics_collector = MagicMock()
@@ -889,9 +901,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
             base_dir = Path(temp_dir)
             config = self.make_config(base_dir)
             manager = MagicMock()
-            manager.populate.return_value = [
-                MagicMock(variation_name="variation_1_heavy", expected_kb=15500)
-            ]
+            manager.populate.return_value = (
+                [MagicMock(variation_name="variation_1_heavy", expected_kb=15500)],
+                {"container-a": 0.0},
+            )
             manager.verify_population.return_value = {"success": True}
             manager.get_containers.return_value = [MagicMock(), MagicMock()]
             metrics_collector = MagicMock()
@@ -1042,6 +1055,115 @@ class GenerationOrchestratorTests(unittest.TestCase):
             ]
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["episode_id"] for row in sft_rows}, {"ep-0"})
+
+
+    def test_circuit_breaker_breaks_on_consecutive_verification_failures(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_successful_rows=100,
+                max_episodes=20,
+                max_consecutive_verification_failures=3,
+            )
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                # All episodes fail with verification error
+                run_single_episode_mock.side_effect = [
+                    self.make_episode(
+                        idx,
+                        row_count=0,
+                        success=False,
+                        space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    )
+                    for idx in range(20)
+                ]
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        # Should have stopped after 3 consecutive failures, not run all 20
+        self.assertEqual(run_single_episode_mock.call_count, 3)
+        self.assertEqual(generation_data.total_episodes_run, 3)
+
+    def test_circuit_breaker_resets_on_successful_episode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_successful_rows=100,
+                max_episodes=10,
+                max_consecutive_verification_failures=3,
+            )
+            with (
+                patch(
+                    "scripts.generate_training_data.ContainerManager"
+                ) as ContainerManager,
+                patch(
+                    "scripts.generate_training_data.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                # 2 failures, then a success, then 2 more failures — should NOT trip
+                run_single_episode_mock.side_effect = [
+                    self.make_episode(
+                        0, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        1, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(2, row_count=1, success=True),
+                    self.make_episode(
+                        3, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        4, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(5, row_count=1, success=True),
+                    self.make_episode(
+                        6, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        7, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(
+                        8, row_count=0, success=False, space_freed_kb=0.0,
+                        error_message="container population verification failed",
+                    ),
+                    self.make_episode(9, row_count=1, success=True),
+                ]
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                )
+
+        # Trips at episode 8 (3 consecutive failures: 6, 7, 8)
+        self.assertEqual(run_single_episode_mock.call_count, 9)
 
 
 if __name__ == "__main__":
