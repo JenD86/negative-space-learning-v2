@@ -20,7 +20,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vllm = ["vllm>=0.13.0", "bitsandbytes>=0.48.1"]
 ml = [
     "datasets>=2.0.0",
     "peft>=0.14.0",
