@@ -11,6 +11,7 @@ from scripts.generate_training_data import (
     save_generation_data,
     select_variation_index,
 )
+from src.observability.types import ResourceSnapshot
 from src.typing.config import AppConfig
 from src.typing.trajectory import EpisodeTrajectory, GenerationData
 
@@ -446,6 +447,31 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(trajectory.prompt_responses), 2)
 
     @patch("scripts.generate_training_data.run_episode_v2")
+    def test_run_single_episode_requires_population_results(
+        self, run_episode_v2: MagicMock
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            manager = MagicMock()
+            manager.populate.return_value = []
+
+            with self.assertRaisesRegex(RuntimeError, "populate returned no results"):
+                run_single_episode(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    container_manager=manager,
+                    config=config,
+                    generation_id=0,
+                    episode_index=0,
+                    variation_index=0,
+                    run_id="run-123",
+                )
+
+        manager.verify_population.assert_not_called()
+        run_episode_v2.assert_not_called()
+
+    @patch("scripts.generate_training_data.run_episode_v2")
     def test_scratchpad_reset_when_configured(self, run_episode_v2: MagicMock) -> None:
         with TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
@@ -735,6 +761,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
                 resource_snapshot_interval_episodes=2,
             )
             metrics_collector = MagicMock()
+            metrics_collector.snapshot_resources.return_value = ResourceSnapshot()
             with (
                 patch(
                     "scripts.generate_training_data.ContainerManager"

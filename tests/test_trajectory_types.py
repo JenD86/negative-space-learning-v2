@@ -20,8 +20,10 @@ class TrajectoryTypeTests(unittest.TestCase):
         inference_call_count: int | None = None,
         average_output_tokens_per_second: float | None = None,
         inference_duty_cycle: float | None = None,
-        gpu_utilization_pct: float | None = None,
-        cpu_utilization_pct: float | None = None,
+        peak_gpu_utilization_pct: float | None = None,
+        peak_cpu_utilization_pct: float | None = None,
+        avg_gpu_utilization_pct: float | None = None,
+        avg_cpu_utilization_pct: float | None = None,
     ) -> EpisodeTrajectory:
         prompt_responses = [
             {
@@ -68,8 +70,10 @@ class TrajectoryTypeTests(unittest.TestCase):
             inference_call_count=inference_call_count,
             average_output_tokens_per_second=average_output_tokens_per_second,
             inference_duty_cycle=inference_duty_cycle,
-            gpu_utilization_pct=gpu_utilization_pct,
-            cpu_utilization_pct=cpu_utilization_pct,
+            peak_gpu_utilization_pct=peak_gpu_utilization_pct,
+            peak_cpu_utilization_pct=peak_cpu_utilization_pct,
+            avg_gpu_utilization_pct=avg_gpu_utilization_pct,
+            avg_cpu_utilization_pct=avg_cpu_utilization_pct,
         )
 
     def test_generation_data_filters_using_generation_threshold(self) -> None:
