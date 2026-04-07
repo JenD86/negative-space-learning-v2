@@ -1,0 +1,40 @@
+dev = true
+model_name = "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
+gpu_memory_utilization = 0.85
+code_host_cache_path = "./code/zero-one/code/"
+container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]
+main_container_idx = 0
+
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"
+
+train_data_save_folder = "./data/zero-one/multi-container/train_data"
+
+[inference]
+max_tokens = 4096
+timeout = 300
+
+[vllm]
+chat_template_path = "./config/chat_templates/qwen2.5-instruct.jinja"
+lora_adapter_path = "./models/adapters/generation_001"
+served_model_name = "nsl-qwen2.5-v1"
+
+# Uncomment this to mount a custom local AWQ base model instead of pulling from HF.
+# local_model_path = "./models/base/custom-awq"
+
+[special_egc]
+count = 1
+max_retries = 8
+
+[strategy_list]
+max_retries = 8
+
+[strategy_code]
+count = 1
+max_retries = 8
+
+[episode]
+action_budget = 15
+scratchpad_max_chars = 10000
+scratchpad_storage_path = "./data/scratchpad.json"
+success_threshold_kb = 0.0

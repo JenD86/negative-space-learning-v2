@@ -7,6 +7,47 @@ from unittest.mock import MagicMock, patch
 
 
 class TestQloraExports(unittest.TestCase):
+    def test_resolve_training_export_format_auto_for_vllm(self) -> None:
+        from src.train.qlora import resolve_training_export_format
+
+        self.assertEqual(
+            resolve_training_export_format("vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"),
+            "peft",
+        )
+
+    def test_resolve_training_export_format_auto_for_llama(self) -> None:
+        from src.train.qlora import resolve_training_export_format
+
+        self.assertEqual(
+            resolve_training_export_format(
+                "llama:unsloth/Qwen2.5-Coder-7B-Instruct-GGUF"
+            ),
+            "gguf",
+        )
+
+    def test_save_lora_adapter_prefers_peft_export(self) -> None:
+        from src.train.qlora import _save_lora_adapter
+
+        model = MagicMock(spec=["save_pretrained", "save_pretrained_merged"])
+        tokenizer = MagicMock()
+
+        def save_pretrained(output_dir: str) -> None:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            (output_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (output_path / "adapter_model.safetensors").write_text(
+                "weights", encoding="utf-8"
+            )
+
+        model.save_pretrained.side_effect = save_pretrained
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "adapter"
+            _save_lora_adapter(model, tokenizer, output_dir, export_format="peft")
+
+        model.save_pretrained.assert_called_once_with(str(output_dir))
+        model.save_pretrained_merged.assert_not_called()
+
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
     def test_export_lora_adapter_saves_adapter_config(
@@ -43,6 +84,40 @@ class TestQloraExports(unittest.TestCase):
             metadata = json.loads((exported_dir / "adapter_info.json").read_text())
             self.assertEqual(metadata["base_model"], "unsloth/Qwen2.5-7B")
             self.assertEqual(metadata["export_method"], "lora")
+
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_export_lora_adapter_uses_peft_save_even_when_merged_export_exists(
+        self,
+        mock_load_base_model: MagicMock,
+        mock_attach_lora_adapter: MagicMock,
+    ) -> None:
+        from src.train.qlora import export_lora_adapter
+
+        model = MagicMock(spec=["save_pretrained", "save_pretrained_merged"])
+        tokenizer = MagicMock()
+
+        def save_pretrained(output_dir: str) -> None:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            (output_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (output_path / "adapter_model.safetensors").write_text(
+                "weights", encoding="utf-8"
+            )
+
+        model.save_pretrained.side_effect = save_pretrained
+        mock_load_base_model.return_value = (model, tokenizer, object())
+        mock_attach_lora_adapter.return_value = model
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "adapter"
+            export_lora_adapter(
+                "unsloth/Qwen2.5-7B",
+                str(output_dir),
+            )
+
+        model.save_pretrained.assert_called_once_with(str(output_dir.resolve()))
+        model.save_pretrained_merged.assert_not_called()
 
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
@@ -248,8 +323,51 @@ class TestTrainSft(unittest.TestCase):
         self.assertEqual(result, output_dir.resolve())
 
     @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
     @patch("src.train.qlora._load_base_model")
-    def test_train_sft_writes_metadata(self, mock_load_base_model, mock_sft_trainer_cls):
+    def test_train_sft_passes_export_format_to_artifact_saver(
+        self,
+        mock_load_base_model,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            return f"<text>{messages[0]['content']}</text>"
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "artifact"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            train_sft(
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+                export_format="merged_16bit",
+            )
+
+        mock_save_training_artifact.assert_called_once()
+        self.assertEqual(
+            mock_save_training_artifact.call_args.kwargs["export_format"],
+            "merged_16bit",
+        )
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_writes_metadata(
+        self, mock_load_base_model, mock_sft_trainer_cls
+    ):
         from src.train.qlora import train_sft
 
         model = MagicMock()

@@ -19,7 +19,7 @@ from scripts.generate_training_data import run_generation, save_generation_data
 from src.backend import resolve_backend_context
 from src.helper import generate_readable_run_id, unflatten_toml_dict
 from src.observability import MetricsCollector, MetricsGenner
-from src.train import train_sft
+from src.train import resolve_training_export_format, train_sft
 from src.typing.config import AppConfig
 
 SFT_ROWS_FILENAME = "sft_training_rows.jsonl"
@@ -28,6 +28,60 @@ SUMMARY_FILENAME = "orchestration_summary.json"
 
 def _adapter_dir(adapter_root: Path, generation_id: int) -> Path:
     return adapter_root / f"after_generation_{generation_id}"
+
+
+def _training_artifact_path(
+    artifact_root: Path,
+    generation_id: int,
+    export_format: str,
+) -> Path:
+    if export_format == "gguf":
+        return artifact_root / f"after_generation_{generation_id}.gguf"
+    return _adapter_dir(artifact_root, generation_id)
+
+
+def _apply_training_artifact(
+    generation_config: AppConfig,
+    artifact_path: Path | None,
+    export_format: str,
+) -> None:
+    if artifact_path is None:
+        return
+
+    backend = generation_config.model_name.strip().split(":", 1)[0]
+    if backend == "vllm":
+        if generation_config.vllm is None:
+            generation_config.vllm = AppConfig.VllmConfig()
+
+        if export_format == "peft":
+            generation_config.vllm.lora_adapter_path = str(artifact_path)
+            return
+
+        if export_format == "merged_16bit":
+            generation_config.vllm.lora_adapter_path = None
+            generation_config.vllm.local_model_path = str(artifact_path)
+            return
+
+        raise ValueError("vLLM training loop does not consume GGUF artifacts")
+
+    if backend == "llama":
+        if export_format != "gguf":
+            raise ValueError("llama backend requires GGUF training artifacts")
+        generation_config.model_name = f"llama:{artifact_path}"
+        return
+
+    raise ValueError(
+        f"Training loop does not know how to apply '{export_format}' artifacts to backend '{backend}'"
+    )
+
+
+def _served_training_artifact_path(config: AppConfig) -> str | None:
+    backend = config.model_name.strip().split(":", 1)[0]
+    if backend == "vllm" and config.vllm is not None:
+        return config.vllm.lora_adapter_path or config.vllm.local_model_path
+    if backend == "llama" and config.model_name.startswith("llama:"):
+        return config.model_name.split(":", 1)[1].strip()
+    return None
 
 
 def _collect_training_window_paths(
@@ -139,16 +193,20 @@ def run_loop(
     )
     generation_root = Path(config.generation.generation_output_dir)
     adapter_root = Path(config.training.adapter_output_dir)
+    training_export_format = resolve_training_export_format(
+        config.model_name,
+        config.training.export_format,
+    )
 
-    latest_adapter_dir: Path | None = None
+    latest_artifact_path: Path | None = None
     results: list[dict[str, Any]] = []
 
     for generation_id in range(config.orchestration.num_generations):
         generation_config = config.model_copy(deep=True)
-        if generation_config.vllm is None:
-            generation_config.vllm = AppConfig.VllmConfig()
-        generation_config.vllm.lora_adapter_path = (
-            str(latest_adapter_dir) if latest_adapter_dir is not None else None
+        _apply_training_artifact(
+            generation_config,
+            latest_artifact_path,
+            training_export_format,
         )
 
         generation_dir = run_generation_phase(
@@ -160,17 +218,23 @@ def run_loop(
         )
 
         training_paths: list[Path] = []
-        trained_adapter_dir: Path | None = None
+        trained_artifact_path: Path | None = None
         if generation_id < config.orchestration.num_generations - 1:
             training_paths = _collect_training_window_paths(
                 generation_root,
                 end_generation_id=generation_id,
                 window_size=config.orchestration.training_window_size,
             )
-            trained_adapter_dir = train_sft(
+            trained_artifact_path = train_sft(
                 base_model=config.training.base_model,
                 training_data_paths=[str(path) for path in training_paths],
-                output_dir=str(_adapter_dir(adapter_root, generation_id)),
+                output_dir=str(
+                    _training_artifact_path(
+                        adapter_root,
+                        generation_id,
+                        training_export_format,
+                    )
+                ),
                 max_seq_length=config.training.max_seq_length,
                 max_steps=config.training.max_steps,
                 per_device_train_batch_size=config.training.per_device_train_batch_size,
@@ -178,17 +242,33 @@ def run_loop(
                 learning_rate=config.training.learning_rate,
                 warmup_steps=config.training.warmup_steps,
                 report_to=config.training.report_to,
+                export_format=training_export_format,
+                gguf_quantize=config.training.gguf_quantize,
             )
-            latest_adapter_dir = trained_adapter_dir
+            latest_artifact_path = trained_artifact_path
 
         results.append(
             {
                 "generation_id": generation_id,
                 "generation_dir": str(generation_dir),
-                "served_adapter_dir": generation_config.vllm.lora_adapter_path,
+                "served_adapter_dir": (
+                    generation_config.vllm.lora_adapter_path
+                    if generation_config.vllm is not None
+                    else None
+                ),
+                "served_artifact_path": _served_training_artifact_path(
+                    generation_config
+                ),
+                "training_export_format": training_export_format,
                 "trained_adapter_dir": (
-                    str(trained_adapter_dir)
-                    if trained_adapter_dir is not None
+                    str(trained_artifact_path)
+                    if trained_artifact_path is not None
+                    and training_export_format == "peft"
+                    else None
+                ),
+                "trained_artifact_path": (
+                    str(trained_artifact_path)
+                    if trained_artifact_path is not None
                     else None
                 ),
                 "training_data_paths": [str(path) for path in training_paths],
@@ -201,6 +281,7 @@ def run_loop(
             "run_id": active_run_id,
             "num_generations": config.orchestration.num_generations,
             "training_window_size": config.orchestration.training_window_size,
+            "training_export_format": training_export_format,
             "generations": results,
         },
     )

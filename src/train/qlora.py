@@ -5,9 +5,10 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence, cast
 
 from unsloth import FastLanguageModel
 
@@ -27,6 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_ADAPTER_EXPORT_ROOT = PROJECT_ROOT / "models" / "adapters"
 DEFAULT_MERGED_EXPORT_ROOT = PROJECT_ROOT / "models" / "merged"
+TrainingExportFormat = Literal["peft", "merged_16bit", "gguf"]
+ConfiguredTrainingExportFormat = Literal["auto", "peft", "merged_16bit", "gguf"]
 LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -111,20 +114,89 @@ def _write_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def _save_lora_adapter(model: Any, tokenizer: Any, output_dir: Path) -> None:
-    save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
-    if callable(save_pretrained_merged):
-        save_pretrained_merged(str(output_dir), tokenizer, save_method="lora")
-        return
+def resolve_training_export_format(
+    model_name: str,
+    configured_format: ConfiguredTrainingExportFormat = "auto",
+) -> TrainingExportFormat:
+    if configured_format != "auto":
+        return cast(TrainingExportFormat, configured_format)
+
+    backend = model_name.strip().split(":", 1)[0]
+    if backend == "llama":
+        return "gguf"
+    return "peft"
+
+
+def _save_lora_adapter(
+    model: Any,
+    tokenizer: Any,
+    output_dir: Path,
+    *,
+    export_format: TrainingExportFormat = "peft",
+) -> None:
+    if export_format != "peft":
+        raise ValueError(f"Unsupported LoRA export format: {export_format}")
 
     save_pretrained = getattr(model, "save_pretrained", None)
-    if not callable(save_pretrained):
-        raise RuntimeError("Model does not expose a supported LoRA export method")
+    if callable(save_pretrained):
+        save_pretrained(str(output_dir))
+    else:
+        save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
+        if not callable(save_pretrained_merged):
+            raise RuntimeError("Model does not expose a supported LoRA export method")
+        save_pretrained_merged(str(output_dir), tokenizer, save_method="lora")
 
-    save_pretrained(str(output_dir))
     tokenizer_save = getattr(tokenizer, "save_pretrained", None)
     if callable(tokenizer_save):
         tokenizer_save(str(output_dir))
+
+
+def _save_merged_model(model: Any, tokenizer: Any, output_dir: Path) -> None:
+    save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
+    if not callable(save_pretrained_merged):
+        raise RuntimeError("Model does not expose save_pretrained_merged()")
+
+    save_pretrained_merged(
+        str(output_dir),
+        tokenizer,
+        save_method="merged_16bit",
+    )
+
+
+def _save_training_artifact(
+    model: Any,
+    tokenizer: Any,
+    output_path: Path,
+    *,
+    export_format: TrainingExportFormat,
+    gguf_quantize: str = "f16",
+) -> Path:
+    if export_format == "peft":
+        output_path.mkdir(parents=True, exist_ok=True)
+        _save_lora_adapter(model, tokenizer, output_path, export_format=export_format)
+        return output_path
+
+    if export_format == "merged_16bit":
+        output_path.mkdir(parents=True, exist_ok=True)
+        _save_merged_model(model, tokenizer, output_path)
+        return output_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adapter_dir = Path(tmpdir) / "adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        _save_lora_adapter(model, tokenizer, adapter_dir)
+        return convert_adapter_to_gguf(
+            str(adapter_dir),
+            str(output_path),
+            quantize=gguf_quantize,
+        )
+
+
+def _training_metadata_path(artifact_path: Path) -> Path:
+    if artifact_path.suffix == ".gguf":
+        return artifact_path.with_suffix(".training_info.json")
+    return artifact_path / "training_info.json"
 
 
 def _load_sft_dataset(training_data_paths: Sequence[Path], tokenizer: Any) -> Any:
@@ -180,6 +252,8 @@ def train_sft(
     warmup_steps: int = 5,
     logging_steps: int = 1,
     report_to: str = "none",
+    export_format: TrainingExportFormat = "peft",
+    gguf_quantize: str = "f16",
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
@@ -187,7 +261,8 @@ def train_sft(
         raise RuntimeError("trl is required for SFT training")
 
     resolved_output_dir = Path(output_dir).expanduser().resolve()
-    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    if export_format != "gguf":
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer, fast_language_model = _load_base_model(
         base_model,
@@ -224,19 +299,26 @@ def train_sft(
     )
     trainer.train()
 
-    _save_lora_adapter(model, tokenizer, resolved_output_dir)
+    artifact_path = _save_training_artifact(
+        model,
+        tokenizer,
+        resolved_output_dir,
+        export_format=export_format,
+        gguf_quantize=gguf_quantize,
+    )
     _write_metadata(
-        resolved_output_dir / "training_info.json",
+        _training_metadata_path(artifact_path),
         {
             "base_model": base_model,
             "max_steps": max_steps,
             "learning_rate": learning_rate,
             "row_count": row_count,
             "training_data_paths": resolved_training_paths,
+            "export_format": export_format,
             "exported_at": _export_timestamp(),
         },
     )
-    return resolved_output_dir
+    return artifact_path
 
 
 def export_lora_adapter(
@@ -286,15 +368,7 @@ def export_merged_model(
     )
     model = _attach_lora_adapter(fast_language_model, model)
 
-    save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
-    if not callable(save_pretrained_merged):
-        raise RuntimeError("Model does not expose save_pretrained_merged()")
-
-    save_pretrained_merged(
-        str(resolved_output_dir),
-        tokenizer,
-        save_method="merged_16bit",
-    )
+    _save_merged_model(model, tokenizer, resolved_output_dir)
     _write_metadata(
         resolved_output_dir / "model_info.json",
         {
@@ -379,6 +453,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--report-to", default="none")
+    parser.add_argument(
+        "--export-format",
+        choices=("peft", "merged_16bit", "gguf"),
+        default="peft",
+    )
     parser.add_argument("--quantize", default="f16")
     return parser
 
@@ -413,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
                 warmup_steps=args.warmup_steps,
                 logging_steps=args.logging_steps,
                 report_to=args.report_to,
+                export_format=args.export_format,
+                gguf_quantize=args.quantize,
             )
         elif args.export_lora:
             output_path = export_lora_adapter(
@@ -434,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "DEFAULT_ADAPTER_EXPORT_ROOT",
     "DEFAULT_MERGED_EXPORT_ROOT",
+    "resolve_training_export_format",
     "train_sft",
     "convert_adapter_to_gguf",
     "export_lora_adapter",

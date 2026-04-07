@@ -103,6 +103,8 @@ class AppConfig(BaseModel):
         max_seq_length: int = 2048
         adapter_output_dir: str = "./models/adapters"
         report_to: str = "none"
+        export_format: Literal["auto", "peft", "merged_16bit", "gguf"] = "auto"
+        gguf_quantize: str = "f16"
 
     training: Optional[TrainingConfig] = None
 

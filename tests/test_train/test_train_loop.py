@@ -213,6 +213,55 @@ training_window_size = 3
             run_loop(config, run_id="run-123", docker_client=MagicMock())
 
         self.assertEqual(served_adapters, [None, str(adapter_dir)])
+        self.assertEqual(mock_train_sft.call_args.kwargs["export_format"], "peft")
+
+    @patch("scripts.run_train_loop.train_sft")
+    @patch("scripts.run_train_loop.run_generation_phase")
+    def test_run_loop_uses_merged_export_as_vllm_local_model(
+        self,
+        mock_run_generation_phase: MagicMock,
+        mock_train_sft: MagicMock,
+    ) -> None:
+        from scripts.run_train_loop import run_loop
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            config.training.export_format = "merged_16bit"
+            served_adapters: list[str | None] = []
+            served_local_models: list[str | None] = []
+            merged_model_dir = base_dir / "adapters" / "after_generation_0"
+
+            def run_generation_side_effect(
+                generation_config,
+                generation_id: int,
+                run_id: str,
+                docker_client,
+                metrics_collector=None,
+            ) -> Path:
+                served_adapters.append(generation_config.vllm.lora_adapter_path)
+                served_local_models.append(generation_config.vllm.local_model_path)
+                generation_dir = (
+                    Path(generation_config.generation.generation_output_dir)
+                    / f"generation_{generation_id}"
+                )
+                self._write_training_rows(
+                    generation_dir / "sft_training_rows.jsonl",
+                    generation_id,
+                )
+                return generation_dir
+
+            mock_run_generation_phase.side_effect = run_generation_side_effect
+            mock_train_sft.return_value = merged_model_dir
+
+            run_loop(config, run_id="run-123", docker_client=MagicMock())
+
+        self.assertEqual(served_adapters, [None, None])
+        self.assertEqual(served_local_models, [None, str(merged_model_dir)])
+        self.assertEqual(
+            mock_train_sft.call_args.kwargs["export_format"],
+            "merged_16bit",
+        )
 
     @patch("scripts.run_train_loop.train_sft")
     @patch("scripts.run_train_loop.run_generation_phase")

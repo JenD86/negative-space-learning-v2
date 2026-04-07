@@ -45,6 +45,7 @@ warmup_steps = 2
 max_seq_length = 1024
 adapter_output_dir = "./models/adapters/test-loop"
 report_to = "none"
+export_format = "peft"
 
 [orchestration]
 num_generations = 2
