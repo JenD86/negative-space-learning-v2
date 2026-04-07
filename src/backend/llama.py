@@ -291,6 +291,14 @@ def setup_llama(
         "--jinja",
     ]
 
+    if app_config.llama is not None and app_config.llama.lora_adapter_path:
+        lora_adapter_path = (
+            Path(app_config.llama.lora_adapter_path).expanduser().resolve()
+        )
+        if not lora_adapter_path.exists():
+            raise FileNotFoundError(f"LoRA adapter not found: {lora_adapter_path}")
+        command.extend(["--lora", str(lora_adapter_path)])
+
     logger.info(f"llama-server command: {' '.join(command)}")
 
     process = None

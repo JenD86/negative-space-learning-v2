@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from typing import Any, Literal, Sequence, cast
 
 from unsloth import FastLanguageModel
 from datasets import Dataset
+from loguru import logger
 from trl.trainer.sft_config import SFTConfig
 from trl.trainer.sft_trainer import SFTTrainer
 
@@ -36,6 +38,10 @@ SUPPORTED_TRAINING_BASE_MODEL_EXAMPLES = (
     "Qwen/Qwen2.5-Coder-7B-Instruct",
     "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
 )
+UNSLOTH_SAVE_METHODS: dict[TrainingExportFormat, str] = {
+    "peft": "lora",
+    "merged_16bit": "merged_16bit",
+}
 
 
 def _export_timestamp() -> str:
@@ -64,11 +70,26 @@ def _validate_training_base_model(base_model: str) -> None:
     )
 
 
+def _cleanup_torch_cuda_state() -> None:
+    gc.collect()
+
+    try:
+        import torch
+    except ImportError:
+        return
+
+    if not torch.cuda.is_available():
+        return
+
+    torch.cuda.empty_cache()
+
+
 def _load_base_model(
     base_model: str,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
 ):
     _validate_training_base_model(base_model)
+    _cleanup_torch_cuda_state()
 
     try:
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -110,13 +131,30 @@ def resolve_training_export_format(
     model_name: str,
     configured_format: ConfiguredTrainingExportFormat = "auto",
 ) -> TrainingExportFormat:
-    if configured_format != "auto":
-        return cast(TrainingExportFormat, configured_format)
-
     backend = model_name.strip().split(":", 1)[0]
-    if backend == "llama":
-        return "gguf"
-    return "peft"
+    if configured_format == "auto":
+        return "peft"
+
+    if backend == "llama" and configured_format == "merged_16bit":
+        raise ValueError(
+            "llama backend does not consume merged_16bit training artifacts. "
+            "Use export_format='peft' for adapters or export_format='gguf' "
+            "for a merged GGUF override."
+        )
+
+    if backend == "vllm" and configured_format == "gguf":
+        raise ValueError(
+            "vLLM does not consume GGUF training artifacts. Use export_format='peft' "
+            "or export_format='merged_16bit'."
+        )
+
+    if backend == "vllm" and configured_format == "merged_16bit":
+        logger.warning(
+            "vLLM merged_16bit override selected. This will usually be slower than "
+            "serving the AWQ base model with a LoRA adapter."
+        )
+
+    return cast(TrainingExportFormat, configured_format)
 
 
 def _save_training_artifact(
@@ -127,15 +165,18 @@ def _save_training_artifact(
     export_format: TrainingExportFormat,
     gguf_quantize: str = "f16",
 ) -> Path:
-
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    if "gguf" not in export_format:
-        model.save_pretrained_merged(output_path, tokenizer, save_method=export_format)
+    if export_format == "gguf":
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained_gguf(
+            output_path, tokenizer, quantization_method=gguf_quantize
+        )
         return output_path
 
-    model.save_pretrained_gguf(
-        output_path, tokenizer, quantization_method=gguf_quantize
+    output_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained_merged(
+        output_path,
+        tokenizer,
+        save_method=UNSLOTH_SAVE_METHODS[export_format],
     )
     return output_path
 

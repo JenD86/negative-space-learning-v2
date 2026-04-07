@@ -1,3 +1,4 @@
+import importlib
 import os
 import socket
 import subprocess
@@ -103,6 +104,102 @@ def _build_models_urls(
         return [models_url]
 
     return [models_url, host_models_url]
+
+
+def _read_gpu_memory_info_mb(device_index: int = 0) -> tuple[float, float] | None:
+    pynvml = None
+    try:
+        pynvml = importlib.import_module("pynvml")
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return (
+            float(memory_info.free / (1024 * 1024)),
+            float(memory_info.total / (1024 * 1024)),
+        )
+    except Exception:
+        pass
+    finally:
+        if pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={device_index}",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return None
+
+    parts = [part.strip() for part in lines[0].split(",")]
+    if len(parts) < 2:
+        return None
+
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+
+
+def wait_for_gpu_memory_release(
+    *,
+    min_free_memory_fraction: float,
+    timeout_s: int,
+    poll_interval_s: float = 2.0,
+    device_index: int = 0,
+) -> None:
+    if timeout_s <= 0:
+        return
+
+    memory_info = _read_gpu_memory_info_mb(device_index)
+    if memory_info is None:
+        logger.warning(
+            "Skipping GPU memory wait because GPU memory metrics are unavailable"
+        )
+        return
+
+    deadline = time.monotonic() + timeout_s
+    required_free_mb = memory_info[1] * min_free_memory_fraction
+
+    while True:
+        free_mb, total_mb = memory_info
+        if free_mb >= required_free_mb:
+            logger.info(
+                f"GPU memory gate passed with {free_mb:.0f} MB free out of {total_mb:.0f} MB"
+            )
+            return
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for GPU memory to be released "
+                f"({free_mb:.0f} MB free, needed {required_free_mb:.0f} MB)"
+            )
+
+        time.sleep(poll_interval_s)
+        memory_info = _read_gpu_memory_info_mb(device_index)
+        if memory_info is None:
+            logger.warning(
+                "GPU memory metrics became unavailable while waiting; continuing without a wait gate"
+            )
+            return
 
 
 def _build_vllm_config(
@@ -476,4 +573,5 @@ __all__ = [
     "LOCAL_ADAPTER_CONTAINER_PATH",
     "LOCAL_MODEL_CONTAINER_PATH",
     "setup_vllm",
+    "wait_for_gpu_memory_release",
 ]

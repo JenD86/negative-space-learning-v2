@@ -267,9 +267,10 @@ class TestVllmContainerLifecycle(unittest.TestCase):
 
         config = make_app_config("vllm:Qwen/Qwen2.5-7B-Instruct")
 
-        with setup_vllm(config) as session:
-            self.assertIsNotNone(session.genner)
-            mock_start.assert_called_once()
+        with patch.dict(os.environ, {"NSL_VLLM_NETWORK_MODE": "auto"}, clear=False):
+            with setup_vllm(config) as session:
+                self.assertIsNotNone(session.genner)
+                mock_start.assert_called_once()
 
         wait_urls = mock_wait.call_args.args[0]
         self.assertEqual(
@@ -666,6 +667,62 @@ class TestWaitForVllmReady(unittest.TestCase):
             [call.args[0] for call in mock_http.call_args_list],
             [urls[0], urls[1], urls[2]],
         )
+
+
+class TestWaitForGpuMemoryRelease(unittest.TestCase):
+    @patch("src.backend.vllm._read_gpu_memory_info_mb")
+    @patch("src.backend.vllm.time")
+    def test_wait_for_gpu_memory_release_returns_when_threshold_met(
+        self,
+        mock_time: MagicMock,
+        mock_read_gpu_memory_info_mb: MagicMock,
+    ) -> None:
+        from src.backend.vllm import wait_for_gpu_memory_release
+
+        mock_time.monotonic.side_effect = [0, 0, 2]
+        mock_time.sleep = MagicMock()
+        mock_read_gpu_memory_info_mb.side_effect = [
+            (2000.0, 12000.0),
+            (11000.0, 12000.0),
+        ]
+
+        wait_for_gpu_memory_release(min_free_memory_fraction=0.9, timeout_s=60)
+
+        self.assertEqual(mock_read_gpu_memory_info_mb.call_count, 2)
+        mock_time.sleep.assert_called_once_with(2.0)
+
+    @patch("src.backend.vllm._read_gpu_memory_info_mb", return_value=(2000.0, 12000.0))
+    @patch("src.backend.vllm.time")
+    def test_wait_for_gpu_memory_release_times_out_when_threshold_not_met(
+        self,
+        mock_time: MagicMock,
+        _mock_read_gpu_memory_info_mb: MagicMock,
+    ) -> None:
+        from src.backend.vllm import wait_for_gpu_memory_release
+
+        mock_time.monotonic.side_effect = [0, 0, 61]
+        mock_time.sleep = MagicMock()
+
+        with self.assertRaises(TimeoutError):
+            wait_for_gpu_memory_release(min_free_memory_fraction=0.9, timeout_s=60)
+
+        mock_time.sleep.assert_called_once_with(2.0)
+
+    @patch("src.backend.vllm._read_gpu_memory_info_mb", return_value=None)
+    @patch("src.backend.vllm.time")
+    def test_wait_for_gpu_memory_release_noops_when_gpu_probe_unavailable(
+        self,
+        mock_time: MagicMock,
+        _mock_read_gpu_memory_info_mb: MagicMock,
+    ) -> None:
+        from src.backend.vllm import wait_for_gpu_memory_release
+
+        mock_time.monotonic.return_value = 0
+        mock_time.sleep = MagicMock()
+
+        wait_for_gpu_memory_release(min_free_memory_fraction=0.9, timeout_s=60)
+
+        mock_time.sleep.assert_not_called()
 
 
 class TestResolveModelForContainer(unittest.TestCase):

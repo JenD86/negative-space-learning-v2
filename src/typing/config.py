@@ -54,6 +54,11 @@ class AppConfig(BaseModel):
 
     vllm: Optional[VllmConfig] = None
 
+    class LlamaConfig(BaseModel):
+        lora_adapter_path: Optional[str] = None
+
+    llama: Optional[LlamaConfig] = None
+
     class ObservabilityConfig(BaseModel):
         enabled: bool = True
         record_inference: bool = True
@@ -105,6 +110,8 @@ class AppConfig(BaseModel):
         report_to: str = "none"
         export_format: Literal["auto", "peft", "merged_16bit", "gguf"] = "auto"
         gguf_quantize: str = "f16"
+        gpu_wait_timeout_seconds: int = 120
+        gpu_wait_min_free_memory_fraction: float = 0.9
 
     training: Optional[TrainingConfig] = None
 

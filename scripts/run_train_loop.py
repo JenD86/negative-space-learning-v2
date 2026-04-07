@@ -17,17 +17,24 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.generate_training_data import run_generation, save_generation_data
 from src.backend import resolve_backend_context
+from src.backend.utils import is_http_ready
+from src.backend.vllm import wait_for_gpu_memory_release
 from src.helper import generate_readable_run_id, unflatten_toml_dict
 from src.observability import MetricsCollector, MetricsGenner
-from src.train import resolve_training_export_format, train_sft
+from src.train import convert_adapter_to_gguf, resolve_training_export_format, train_sft
 from src.typing.config import AppConfig
 
 SFT_ROWS_FILENAME = "sft_training_rows.jsonl"
 SUMMARY_FILENAME = "orchestration_summary.json"
+DEFAULT_VLLM_MODELS_URL = "http://127.0.0.1:8000/v1/models"
 
 
 def _adapter_dir(adapter_root: Path, generation_id: int) -> Path:
     return adapter_root / f"after_generation_{generation_id}"
+
+
+def _llama_lora_path(adapter_dir: Path) -> Path:
+    return adapter_dir / "adapter.gguf"
 
 
 def _training_artifact_path(
@@ -38,6 +45,25 @@ def _training_artifact_path(
     if export_format == "gguf":
         return artifact_root / f"after_generation_{generation_id}.gguf"
     return _adapter_dir(artifact_root, generation_id)
+
+
+def _prepare_training_artifact_for_backend(
+    config: AppConfig,
+    artifact_path: Path,
+    export_format: str,
+) -> Path:
+    backend = config.model_name.strip().split(":", 1)[0]
+    if backend != "llama" or export_format != "peft":
+        return artifact_path
+
+    if config.training is None:
+        raise ValueError("training config is required to prepare llama artifacts")
+
+    return convert_adapter_to_gguf(
+        str(artifact_path),
+        str(_llama_lora_path(artifact_path)),
+        quantize=config.training.gguf_quantize,
+    )
 
 
 def _apply_training_artifact(
@@ -65,20 +91,43 @@ def _apply_training_artifact(
         raise ValueError("vLLM training loop does not consume GGUF artifacts")
 
     if backend == "llama":
-        if export_format != "gguf":
-            raise ValueError("llama backend requires GGUF training artifacts")
-        generation_config.model_name = f"llama:{artifact_path}"
-        return
+        if generation_config.llama is None:
+            generation_config.llama = AppConfig.LlamaConfig()
+
+        if export_format == "peft":
+            generation_config.llama.lora_adapter_path = str(artifact_path)
+            return
+
+        if export_format == "gguf":
+            generation_config.llama.lora_adapter_path = None
+            generation_config.model_name = f"llama:{artifact_path}"
+            return
+
+        raise ValueError("llama backend only supports PEFT adapters or GGUF artifacts")
 
     raise ValueError(
         f"Training loop does not know how to apply '{export_format}' artifacts to backend '{backend}'"
     )
 
 
+def _served_adapter_path(config: AppConfig) -> str | None:
+    if config.vllm is not None:
+        return config.vllm.lora_adapter_path
+    if config.llama is not None:
+        return config.llama.lora_adapter_path
+    return None
+
+
 def _served_training_artifact_path(config: AppConfig) -> str | None:
     backend = config.model_name.strip().split(":", 1)[0]
     if backend == "vllm" and config.vllm is not None:
         return config.vllm.lora_adapter_path or config.vllm.local_model_path
+    if (
+        backend == "llama"
+        and config.llama is not None
+        and config.llama.lora_adapter_path
+    ):
+        return config.llama.lora_adapter_path
     if backend == "llama" and config.model_name.startswith("llama:"):
         return config.model_name.split(":", 1)[1].strip()
     return None
@@ -108,6 +157,30 @@ def _orchestration_summary_path(generation_root: Path) -> Path:
     return generation_root / SUMMARY_FILENAME
 
 
+def _vllm_server_is_ready(models_url: str = DEFAULT_VLLM_MODELS_URL) -> bool:
+    return is_http_ready(models_url)
+
+
+def _should_wait_for_vllm_gpu_release(
+    config: AppConfig,
+    generation_id: int,
+) -> bool:
+    if config.training is None or config.orchestration is None:
+        return False
+
+    if generation_id >= config.orchestration.num_generations - 1:
+        return False
+
+    if config.training.gpu_wait_timeout_seconds <= 0:
+        return False
+
+    backend = config.model_name.strip().split(":", 1)[0]
+    if backend != "vllm":
+        return False
+
+    return not _vllm_server_is_ready()
+
+
 def _write_summary(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -133,7 +206,7 @@ def run_generation_phase(
         if config.vllm and config.vllm.served_model_name
         else config.model_name
     )
-    served_adapter_dir = config.vllm.lora_adapter_path if config.vllm else None
+    served_adapter_dir = _served_adapter_path(config)
     logger.info(
         f"Starting generation {generation_id} with model={served_model_name} "
         f"adapter={served_adapter_dir or '<base>'}"
@@ -191,8 +264,8 @@ def run_loop(
     active_docker_client = (
         docker_client if docker_client is not None else docker.from_env()
     )
-    generation_root = Path(config.generation.generation_output_dir)
-    adapter_root = Path(config.training.adapter_output_dir)
+    generation_root = Path(config.generation.generation_output_dir) / active_run_id
+    adapter_root = Path(config.training.adapter_output_dir) / active_run_id
     training_export_format = resolve_training_export_format(
         config.model_name,
         config.training.export_format,
@@ -203,10 +276,16 @@ def run_loop(
 
     for generation_id in range(config.orchestration.num_generations):
         generation_config = config.model_copy(deep=True)
+        assert generation_config.generation is not None
+        generation_config.generation.generation_output_dir = str(generation_root)
         _apply_training_artifact(
             generation_config,
             latest_artifact_path,
             training_export_format,
+        )
+        should_wait_for_gpu_release = _should_wait_for_vllm_gpu_release(
+            generation_config,
+            generation_id,
         )
 
         generation_dir = run_generation_phase(
@@ -220,6 +299,15 @@ def run_loop(
         training_paths: list[Path] = []
         trained_artifact_path: Path | None = None
         if generation_id < config.orchestration.num_generations - 1:
+            if should_wait_for_gpu_release:
+                logger.info("Waiting for GPU memory to be released before training")
+                wait_for_gpu_memory_release(
+                    min_free_memory_fraction=(
+                        config.training.gpu_wait_min_free_memory_fraction
+                    ),
+                    timeout_s=config.training.gpu_wait_timeout_seconds,
+                )
+
             training_paths = _collect_training_window_paths(
                 generation_root,
                 end_generation_id=generation_id,
@@ -245,17 +333,19 @@ def run_loop(
                 export_format=training_export_format,
                 gguf_quantize=config.training.gguf_quantize,
             )
-            latest_artifact_path = trained_artifact_path
+            if trained_artifact_path is None:
+                raise RuntimeError("train_sft returned no artifact path")
+            latest_artifact_path = _prepare_training_artifact_for_backend(
+                config,
+                trained_artifact_path,
+                training_export_format,
+            )
 
         results.append(
             {
                 "generation_id": generation_id,
                 "generation_dir": str(generation_dir),
-                "served_adapter_dir": (
-                    generation_config.vllm.lora_adapter_path
-                    if generation_config.vllm is not None
-                    else None
-                ),
+                "served_adapter_dir": _served_adapter_path(generation_config),
                 "served_artifact_path": _served_training_artifact_path(
                     generation_config
                 ),
@@ -306,7 +396,9 @@ def main(argv: list[str] | None = None) -> Path:
     run_id = generate_readable_run_id()
     metrics_collector = MetricsCollector.from_config(config, run_id)
     run_loop(config, run_id=run_id, metrics_collector=metrics_collector)
-    return _orchestration_summary_path(Path(config.generation.generation_output_dir))
+    return _orchestration_summary_path(
+        Path(config.generation.generation_output_dir) / run_id
+    )
 
 
 if __name__ == "__main__":

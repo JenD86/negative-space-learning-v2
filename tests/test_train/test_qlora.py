@@ -22,7 +22,56 @@ class TestQloraExports(unittest.TestCase):
             resolve_training_export_format(
                 "llama:unsloth/Qwen2.5-Coder-7B-Instruct-GGUF"
             ),
+            "peft",
+        )
+
+    def test_resolve_training_export_format_respects_llama_gguf_override(self) -> None:
+        from src.train.qlora import resolve_training_export_format
+
+        self.assertEqual(
+            resolve_training_export_format(
+                "llama:unsloth/Qwen2.5-Coder-7B-Instruct-GGUF",
+                configured_format="gguf",
+            ),
             "gguf",
+        )
+
+    @patch("src.train.qlora.logger.warning")
+    def test_resolve_training_export_format_warns_for_vllm_merged_override(
+        self,
+        mock_warning: MagicMock,
+    ) -> None:
+        from src.train.qlora import resolve_training_export_format
+
+        self.assertEqual(
+            resolve_training_export_format(
+                "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+                configured_format="merged_16bit",
+            ),
+            "merged_16bit",
+        )
+        mock_warning.assert_called_once()
+
+    def test_save_training_artifact_uses_lora_save_method_for_peft(self) -> None:
+        from src.train.qlora import _save_training_artifact
+
+        model = MagicMock(spec=["save_pretrained_merged"])
+        tokenizer = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "adapter"
+            artifact_path = _save_training_artifact(
+                model,
+                tokenizer,
+                output_dir,
+                export_format="peft",
+            )
+
+        self.assertEqual(artifact_path, output_dir)
+        model.save_pretrained_merged.assert_called_once_with(
+            output_dir,
+            tokenizer,
+            save_method="lora",
         )
 
     @patch("src.train.qlora._attach_lora_adapter")
@@ -219,6 +268,50 @@ class TestLoadSftDataset(unittest.TestCase):
             )
             dataset = _load_sft_dataset([path], tokenizer)
         self.assertEqual(len(dataset), 1)
+
+
+class TestQloraGpuCleanup(unittest.TestCase):
+    @patch("src.train.qlora.FastLanguageModel.from_pretrained")
+    @patch("src.train.qlora.gc.collect")
+    def test_load_base_model_clears_torch_cuda_state_before_loading(
+        self,
+        mock_collect: MagicMock,
+        mock_from_pretrained: MagicMock,
+    ) -> None:
+        from src.train.qlora import _load_base_model
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        expected_model = MagicMock()
+        expected_tokenizer = MagicMock()
+        mock_from_pretrained.return_value = (expected_model, expected_tokenizer)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            model, tokenizer = _load_base_model("Qwen/Qwen2.5-Coder-7B-Instruct")
+
+        mock_collect.assert_called_once()
+        fake_torch.cuda.empty_cache.assert_called_once()
+        self.assertIs(model, expected_model)
+        self.assertIs(tokenizer, expected_tokenizer)
+
+    @patch("src.train.qlora.FastLanguageModel.from_pretrained")
+    @patch("src.train.qlora.gc.collect")
+    def test_cleanup_torch_cuda_state_skips_when_cuda_unavailable(
+        self,
+        mock_collect: MagicMock,
+        mock_from_pretrained: MagicMock,
+    ) -> None:
+        from src.train.qlora import _load_base_model
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        mock_from_pretrained.return_value = (MagicMock(), MagicMock())
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            _load_base_model("Qwen/Qwen2.5-Coder-7B-Instruct")
+
+        mock_collect.assert_called_once()
+        fake_torch.cuda.empty_cache.assert_not_called()
 
 
 class TestTrainSft(unittest.TestCase):
