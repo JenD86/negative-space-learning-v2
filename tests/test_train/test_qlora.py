@@ -25,29 +25,6 @@ class TestQloraExports(unittest.TestCase):
             "gguf",
         )
 
-    def test_save_lora_adapter_prefers_peft_export(self) -> None:
-        from src.train.qlora import _save_lora_adapter
-
-        model = MagicMock(spec=["save_pretrained", "save_pretrained_merged"])
-        tokenizer = MagicMock()
-
-        def save_pretrained(output_dir: str) -> None:
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            (output_path / "adapter_config.json").write_text("{}", encoding="utf-8")
-            (output_path / "adapter_model.safetensors").write_text(
-                "weights", encoding="utf-8"
-            )
-
-        model.save_pretrained.side_effect = save_pretrained
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir) / "adapter"
-            _save_lora_adapter(model, tokenizer, output_dir, export_format="peft")
-
-        model.save_pretrained.assert_called_once_with(str(output_dir))
-        model.save_pretrained_merged.assert_not_called()
-
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
     def test_export_lora_adapter_saves_adapter_config(
@@ -57,10 +34,14 @@ class TestQloraExports(unittest.TestCase):
     ) -> None:
         from src.train.qlora import export_lora_adapter
 
-        model = MagicMock(spec=["save_pretrained"])
+        model = MagicMock(spec=["save_pretrained_merged"])
         tokenizer = MagicMock()
 
-        def save_pretrained(output_dir: str) -> None:
+        def save_pretrained_merged(
+            output_dir: Path,
+            tokenizer_arg: MagicMock,
+            save_method: str,
+        ) -> None:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             (output_path / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -68,8 +49,8 @@ class TestQloraExports(unittest.TestCase):
                 "weights", encoding="utf-8"
             )
 
-        model.save_pretrained.side_effect = save_pretrained
-        mock_load_base_model.return_value = (model, tokenizer, object())
+        model.save_pretrained_merged.side_effect = save_pretrained_merged
+        mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,39 +66,10 @@ class TestQloraExports(unittest.TestCase):
             self.assertEqual(metadata["base_model"], "unsloth/Qwen2.5-7B")
             self.assertEqual(metadata["export_method"], "lora")
 
-    @patch("src.train.qlora._attach_lora_adapter")
-    @patch("src.train.qlora._load_base_model")
-    def test_export_lora_adapter_uses_peft_save_even_when_merged_export_exists(
-        self,
-        mock_load_base_model: MagicMock,
-        mock_attach_lora_adapter: MagicMock,
-    ) -> None:
-        from src.train.qlora import export_lora_adapter
-
-        model = MagicMock(spec=["save_pretrained", "save_pretrained_merged"])
-        tokenizer = MagicMock()
-
-        def save_pretrained(output_dir: str) -> None:
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            (output_path / "adapter_config.json").write_text("{}", encoding="utf-8")
-            (output_path / "adapter_model.safetensors").write_text(
-                "weights", encoding="utf-8"
-            )
-
-        model.save_pretrained.side_effect = save_pretrained
-        mock_load_base_model.return_value = (model, tokenizer, object())
-        mock_attach_lora_adapter.return_value = model
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir) / "adapter"
-            export_lora_adapter(
-                "unsloth/Qwen2.5-7B",
-                str(output_dir),
-            )
-
-        model.save_pretrained.assert_called_once_with(str(output_dir.resolve()))
-        model.save_pretrained_merged.assert_not_called()
+        model.save_pretrained_merged.assert_called_once()
+        self.assertEqual(
+            model.save_pretrained_merged.call_args.kwargs["save_method"], "lora"
+        )
 
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
@@ -143,7 +95,7 @@ class TestQloraExports(unittest.TestCase):
             (output_path / "model.safetensors").write_text("weights", encoding="utf-8")
 
         model.save_pretrained_merged.side_effect = save_pretrained_merged
-        mock_load_base_model.return_value = (model, tokenizer, object())
+        mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -290,8 +242,11 @@ class TestTrainSft(unittest.TestCase):
         }
 
     @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
-    def test_train_sft_runs_trainer(self, mock_load_base_model, mock_sft_trainer_cls):
+    def test_train_sft_runs_trainer(
+        self, mock_load_base_model, mock_attach_lora_adapter, mock_sft_trainer_cls
+    ):
         from src.train.qlora import train_sft
 
         model = MagicMock()
@@ -302,7 +257,8 @@ class TestTrainSft(unittest.TestCase):
 
         tokenizer.apply_chat_template.side_effect = apply_chat_template
         tokenizer.eos_token = "<|endoftext|>"
-        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
 
         trainer_instance = MagicMock()
         mock_sft_trainer_cls.return_value = trainer_instance
@@ -324,10 +280,12 @@ class TestTrainSft(unittest.TestCase):
 
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
     def test_train_sft_passes_export_format_to_artifact_saver(
         self,
         mock_load_base_model,
+        mock_attach_lora_adapter,
         mock_save_training_artifact,
         mock_sft_trainer_cls,
     ):
@@ -340,7 +298,8 @@ class TestTrainSft(unittest.TestCase):
             return f"<text>{messages[0]['content']}</text>"
 
         tokenizer.apply_chat_template.side_effect = apply_chat_template
-        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
         mock_sft_trainer_cls.return_value = MagicMock()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -364,9 +323,10 @@ class TestTrainSft(unittest.TestCase):
         )
 
     @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
     def test_train_sft_writes_metadata(
-        self, mock_load_base_model, mock_sft_trainer_cls
+        self, mock_load_base_model, mock_attach_lora_adapter, mock_sft_trainer_cls
     ):
         from src.train.qlora import train_sft
 
@@ -378,7 +338,8 @@ class TestTrainSft(unittest.TestCase):
 
         tokenizer.apply_chat_template.side_effect = apply_chat_template
         tokenizer.eos_token = "<|endoftext|>"
-        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
         mock_sft_trainer_cls.return_value = MagicMock()
 
         with tempfile.TemporaryDirectory() as tmpdir:

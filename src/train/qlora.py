@@ -11,18 +11,10 @@ from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 
 from unsloth import FastLanguageModel
+from datasets import Dataset
+from trl.trainer.sft_config import SFTConfig
+from trl.trainer.sft_trainer import SFTTrainer
 
-try:
-    from datasets import Dataset
-except ImportError:  # pragma: no cover - optional dependency
-    Dataset = None
-
-try:
-    from trl.trainer.sft_config import SFTConfig
-    from trl.trainer.sft_trainer import SFTTrainer
-except ImportError:  # pragma: no cover - optional dependency
-    SFTConfig = None
-    SFTTrainer = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_SEQ_LENGTH = 2048
@@ -75,7 +67,7 @@ def _validate_training_base_model(base_model: str) -> None:
 def _load_base_model(
     base_model: str,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
-) -> tuple[Any, Any, Any]:
+):
     _validate_training_base_model(base_model)
 
     try:
@@ -95,15 +87,15 @@ def _load_base_model(
                 f"Use a Transformers-compatible training checkpoint or an Unsloth BnB checkpoint, for example {examples}."
             ) from exc
         raise
-    return model, tokenizer, FastLanguageModel
+    return model, tokenizer
 
 
-def _attach_lora_adapter(fast_language_model: Any, model: Any) -> Any:
-    return fast_language_model.get_peft_model(
+def _attach_lora_adapter(model: Any, config: dict[str, Any]) -> Any:
+    return FastLanguageModel.get_peft_model(
         model,
-        r=32,
-        target_modules=LORA_TARGET_MODULES,
-        lora_alpha=32,
+        r=config.get("rank", 32),
+        target_modules=config.get("target_modules", LORA_TARGET_MODULES),
+        lora_alpha=config.get("alpha", 32),
         lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -127,42 +119,6 @@ def resolve_training_export_format(
     return "peft"
 
 
-def _save_lora_adapter(
-    model: Any,
-    tokenizer: Any,
-    output_dir: Path,
-    *,
-    export_format: TrainingExportFormat = "peft",
-) -> None:
-    if export_format != "peft":
-        raise ValueError(f"Unsupported LoRA export format: {export_format}")
-
-    save_pretrained = getattr(model, "save_pretrained", None)
-    if callable(save_pretrained):
-        save_pretrained(str(output_dir))
-    else:
-        save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
-        if not callable(save_pretrained_merged):
-            raise RuntimeError("Model does not expose a supported LoRA export method")
-        save_pretrained_merged(str(output_dir), tokenizer, save_method="lora")
-
-    tokenizer_save = getattr(tokenizer, "save_pretrained", None)
-    if callable(tokenizer_save):
-        tokenizer_save(str(output_dir))
-
-
-def _save_merged_model(model: Any, tokenizer: Any, output_dir: Path) -> None:
-    save_pretrained_merged = getattr(model, "save_pretrained_merged", None)
-    if not callable(save_pretrained_merged):
-        raise RuntimeError("Model does not expose save_pretrained_merged()")
-
-    save_pretrained_merged(
-        str(output_dir),
-        tokenizer,
-        save_method="merged_16bit",
-    )
-
-
 def _save_training_artifact(
     model: Any,
     tokenizer: Any,
@@ -171,26 +127,17 @@ def _save_training_artifact(
     export_format: TrainingExportFormat,
     gguf_quantize: str = "f16",
 ) -> Path:
-    if export_format == "peft":
-        output_path.mkdir(parents=True, exist_ok=True)
-        _save_lora_adapter(model, tokenizer, output_path, export_format=export_format)
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if "gguf" not in export_format:
+        model.save_pretrained_merged(output_path, tokenizer, save_method=export_format)
         return output_path
 
-    if export_format == "merged_16bit":
-        output_path.mkdir(parents=True, exist_ok=True)
-        _save_merged_model(model, tokenizer, output_path)
-        return output_path
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        adapter_dir = Path(tmpdir) / "adapter"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        _save_lora_adapter(model, tokenizer, adapter_dir)
-        return convert_adapter_to_gguf(
-            str(adapter_dir),
-            str(output_path),
-            quantize=gguf_quantize,
-        )
+    model.save_pretrained_gguf(
+        output_path, tokenizer, quantization_method=gguf_quantize
+    )
+    return output_path
 
 
 def _training_metadata_path(artifact_path: Path) -> Path:
@@ -257,18 +204,15 @@ def train_sft(
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
-    if SFTConfig is None or SFTTrainer is None:
-        raise RuntimeError("trl is required for SFT training")
+    model, tokenizer = _load_base_model(
+        base_model,
+        max_seq_length=max_seq_length,
+    )
+    model = _attach_lora_adapter(model, {})
 
     resolved_output_dir = Path(output_dir).expanduser().resolve()
     if export_format != "gguf":
         resolved_output_dir.mkdir(parents=True, exist_ok=True)
-
-    model, tokenizer, fast_language_model = _load_base_model(
-        base_model,
-        max_seq_length=max_seq_length,
-    )
-    model = _attach_lora_adapter(fast_language_model, model)
 
     resolved_training_paths = [
         str(Path(path).expanduser().resolve()) for path in training_data_paths
@@ -332,12 +276,12 @@ def export_lora_adapter(
     resolved_output_dir = Path(output_dir).expanduser().resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    model, tokenizer, fast_language_model = _load_base_model(
+    model, tokenizer = _load_base_model(
         base_model,
         max_seq_length=max_seq_length,
     )
-    model = _attach_lora_adapter(fast_language_model, model)
-    _save_lora_adapter(model, tokenizer, resolved_output_dir)
+    model = _attach_lora_adapter(model, {})
+    model.save_pretrained_merged(resolved_output_dir, tokenizer, save_method="lora")
 
     _write_metadata(
         resolved_output_dir / "adapter_info.json",
@@ -362,13 +306,16 @@ def export_merged_model(
     resolved_output_dir = Path(output_dir).expanduser().resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    model, tokenizer, fast_language_model = _load_base_model(
+    model, tokenizer = _load_base_model(
         base_model,
         max_seq_length=max_seq_length,
     )
-    model = _attach_lora_adapter(fast_language_model, model)
+    model = _attach_lora_adapter(model, {})
 
-    _save_merged_model(model, tokenizer, resolved_output_dir)
+    model.save_pretrained_merged(
+        resolved_output_dir, tokenizer, save_method="merged_16bit"
+    )
+
     _write_metadata(
         resolved_output_dir / "model_info.json",
         {

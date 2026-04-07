@@ -20,6 +20,7 @@ code/
 
 # unsloth artifacts
 unsloth_compiled_cache/
+models/
 
 # Model cache
 .model-cache/
