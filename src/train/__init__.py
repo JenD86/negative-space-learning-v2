@@ -4,6 +4,7 @@ __all__ = [
     "convert_adapter_to_gguf",
     "export_lora_adapter",
     "export_merged_model",
+    "train_sft",
 ]
 
 

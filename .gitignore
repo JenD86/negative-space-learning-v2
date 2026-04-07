@@ -18,5 +18,8 @@ code/
 # llama.cpp binary
 .llama/
 
+# unsloth artifacts
+unsloth_compiled_cache/
+
 # Model cache
 .model-cache/

@@ -93,6 +93,25 @@ class AppConfig(BaseModel):
 
     generation: Optional[GenerationConfig] = None
 
+    class TrainingConfig(BaseModel):
+        base_model: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
+        max_steps: int = 50
+        per_device_train_batch_size: int = 2
+        gradient_accumulation_steps: int = 4
+        learning_rate: float = 2e-4
+        warmup_steps: int = 5
+        max_seq_length: int = 2048
+        adapter_output_dir: str = "./models/adapters"
+        report_to: str = "none"
+
+    training: Optional[TrainingConfig] = None
+
+    class OrchestrationConfig(BaseModel):
+        num_generations: int = 1
+        training_window_size: int = 3
+
+    orchestration: Optional[OrchestrationConfig] = None
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, values):

@@ -1,7 +1,5 @@
 dev = true
-# model_name = "vllm:Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
-model_name = "vllm:unsloth/Qwen2.5-Coder-7B-bnb-4bit"
-# model_name = "vllm:bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF"
+model_name = "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
 gpu_memory_utilization = 0.85
 code_host_cache_path = "./code/zero-one/code/"
 container_ids = ["special-learn-compose_service-a_1", "special-learn-compose_service-b_1"]

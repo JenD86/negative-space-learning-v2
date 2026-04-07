@@ -115,5 +115,201 @@ class TestQloraExports(unittest.TestCase):
         self.assertIn(str(adapter_dir.resolve()), command)
 
 
+class TestLoadSftDataset(unittest.TestCase):
+    def _make_jsonl(self, rows: list[dict], path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def _make_tokenizer(self):
+        tokenizer = MagicMock()
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            user_content = messages[0]["content"]
+            asst_content = messages[1]["content"]
+            return f"<user>{user_content}</user><asst>{asst_content}</asst>"
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        return tokenizer
+
+    def _make_row(self, *, success: bool = True, **kwargs) -> dict:
+        base = {
+            "prompt": "Do something",
+            "raw_response": "Done",
+            "timestamp": "2026-04-06T00:00:00",
+            "interaction_type": "orchestrator",
+            "success": success,
+            "error_message": None,
+            "episode_id": "ep_gen0_0001_123",
+            "generation_id": 0,
+            "episode_space_freed_kb": 100.0,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_load_sft_dataset_from_jsonl(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(), self._make_row()], path)
+            dataset = _load_sft_dataset([path], tokenizer)
+        self.assertGreater(len(dataset), 0)
+        self.assertIn("text", dataset.column_names)
+
+    def test_load_sft_dataset_multiple_files(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path0 = Path(tmpdir) / "gen0" / "sft_training_rows.jsonl"
+            path1 = Path(tmpdir) / "gen1" / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(generation_id=0)], path0)
+            self._make_jsonl([self._make_row(generation_id=1)], path1)
+            dataset = _load_sft_dataset([path0, path1], tokenizer)
+        self.assertEqual(len(dataset), 2)
+
+    def test_load_sft_dataset_empty_input(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([], path)
+            with self.assertRaises(ValueError, msg="No training rows found"):
+                _load_sft_dataset([path], tokenizer)
+
+    def test_load_sft_dataset_filters_unsuccessful(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl(
+                [self._make_row(success=True), self._make_row(success=False)], path
+            )
+            dataset = _load_sft_dataset([path], tokenizer)
+        self.assertEqual(len(dataset), 1)
+
+
+class TestTrainSft(unittest.TestCase):
+    def _make_jsonl(self, rows: list[dict], path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def _make_row(self) -> dict:
+        return {
+            "prompt": "Do something",
+            "raw_response": "Done",
+            "timestamp": "2026-04-06T00:00:00",
+            "interaction_type": "orchestrator",
+            "success": True,
+            "error_message": None,
+            "episode_id": "ep_gen0_0001_123",
+            "generation_id": 0,
+            "episode_space_freed_kb": 100.0,
+        }
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_runs_trainer(self, mock_load_base_model, mock_sft_trainer_cls):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            return f"<text>{messages[0]['content']}</text>"
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer.eos_token = "<|endoftext|>"
+        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+
+        trainer_instance = MagicMock()
+        mock_sft_trainer_cls.return_value = trainer_instance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+
+            result = train_sft(
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+            )
+
+        trainer_instance.train.assert_called_once()
+        self.assertEqual(result, output_dir.resolve())
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_writes_metadata(self, mock_load_base_model, mock_sft_trainer_cls):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            return f"<text>{messages[0]['content']}</text>"
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer.eos_token = "<|endoftext|>"
+        mock_load_base_model.return_value = (model, tokenizer, MagicMock())
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(), self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+
+            train_sft(
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+                learning_rate=1e-4,
+            )
+
+            metadata = json.loads(
+                (output_dir.resolve() / "training_info.json").read_text()
+            )
+
+        self.assertEqual(metadata["base_model"], "Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.assertEqual(metadata["learning_rate"], 1e-4)
+        self.assertEqual(metadata["row_count"], 2)
+        self.assertIn("training_data_paths", metadata)
+        self.assertIn("exported_at", metadata)
+        self.assertIn("max_steps", metadata)
+
+    def test_train_sft_cli_multiple_training_data(self):
+        """CLI --train mode should accept multiple --training-data arguments."""
+        from src.train.qlora import _build_arg_parser
+
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--train",
+                "--base-model",
+                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "--training-data",
+                "./data/gen0/sft.jsonl",
+                "--training-data",
+                "./data/gen1/sft.jsonl",
+                "--output",
+                "./models/adapters/test",
+            ]
+        )
+        self.assertTrue(args.train)
+        self.assertEqual(len(args.training_data), 2)
+        self.assertIn("./data/gen0/sft.jsonl", args.training_data)
+        self.assertIn("./data/gen1/sft.jsonl", args.training_data)
+
+
 if __name__ == "__main__":
     unittest.main()
